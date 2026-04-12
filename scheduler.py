@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
-from .scanner import run_scan
+from scanner import run_scan
 
 
 def main() -> None:
