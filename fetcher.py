@@ -1,3 +1,13 @@
+def get_all_taiwan_stocks():
+    return [
+        info
+        for _, info in twstock.codes.items()
+        if getattr(info, "market", "") in ["上市", "上櫃"]
+        and str(getattr(info, "code", "")).isdigit()
+        and len(str(getattr(info, "code", ""))) == 4
+    ]
+
+
 def fetch_market_snapshot_parallel(progress_every: int = 20, batch_size: int = 20) -> pd.DataFrame:
     print("[FETCH] Loading Taiwan stock list...")
     codes = get_all_taiwan_stocks()
@@ -50,7 +60,6 @@ def fetch_market_snapshot_parallel(progress_every: int = 20, batch_size: int = 2
                         failed += 1
                         print(f"[FETCH][ERROR] {info.code} {info.name}: {e}")
 
-        # 這批還沒完成的，直接視為 timeout
         if future_map:
             for future, info in future_map.items():
                 failed += 1
