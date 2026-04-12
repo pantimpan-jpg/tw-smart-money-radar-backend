@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import traceback
 from datetime import datetime, timezone
 from typing import Any
 
@@ -28,27 +29,42 @@ scheduler = BackgroundScheduler(timezone=ZoneInfo("Asia/Taipei"))
 
 scan_running = False
 last_scan_error: str | None = None
+last_finished_at: str | None = None
+scan_lock = threading.Lock()
 
 
 def _run_scan_job() -> None:
-    global scan_running, last_scan_error
-    if scan_running:
-        return
+    global scan_running, last_scan_error, last_finished_at
 
-    scan_running = True
+    with scan_lock:
+        if scan_running:
+            print("[SCAN] Skip: already running")
+            return
+        scan_running = True
+
     last_scan_error = None
+
     try:
-        run_scan(save=True)
+        print("[SCAN] === Starting scan job ===")
+        result = run_scan(save=True)
+        last_finished_at = datetime.now(timezone.utc).isoformat()
+        print("[SCAN] === Scan completed successfully ===")
+        if isinstance(result, dict):
+            print(f"[SCAN] Result keys: {list(result.keys())}")
     except Exception as e:
         last_scan_error = str(e)
-        print(f"[SCAN ERROR] {e}")
+        print("[SCAN] === Scan failed ===")
+        print(f"[SCAN] Error: {e}")
+        print(traceback.format_exc())
     finally:
         scan_running = False
+        print("[SCAN] === Scan thread finished ===")
 
 
 @app.on_event("startup")
 def startup_event() -> None:
     if not scheduler.running:
+        print("[APP] Starting scheduler")
         scheduler.add_job(
             _run_scan_job,
             CronTrigger(day_of_week="mon-fri", hour=21, minute=0),
@@ -56,11 +72,13 @@ def startup_event() -> None:
             replace_existing=True,
         )
         scheduler.start()
+        print("[APP] Scheduler started: Mon-Fri 21:00 Asia/Taipei")
 
 
 @app.on_event("shutdown")
 def shutdown_event() -> None:
     if scheduler.running:
+        print("[APP] Shutting down scheduler")
         scheduler.shutdown()
 
 
@@ -74,6 +92,7 @@ def health() -> dict[str, Any]:
         "schedule": "Mon-Fri 21:00 Asia/Taipei",
         "scan_running": scan_running,
         "last_scan_error": last_scan_error,
+        "last_finished_at": last_finished_at,
     }
 
 
@@ -88,11 +107,14 @@ def get_latest_scan() -> dict[str, Any]:
 @app.post("/api/scan/run")
 def trigger_scan() -> dict[str, Any]:
     global scan_running
+
     if scan_running:
         return {
             "ok": True,
             "message": "掃描已在執行中",
         }
+
+    print("[API] Manual trigger received")
 
     thread = threading.Thread(target=_run_scan_job, daemon=True)
     thread.start()
@@ -111,7 +133,7 @@ def get_scan_status() -> dict[str, Any]:
     return {
         "scan_running": scan_running,
         "last_scan_error": last_scan_error,
-        "last_updated": updated_at,
+        "last_updated": updated_at or last_finished_at,
     }
 
 
