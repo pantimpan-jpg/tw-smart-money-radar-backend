@@ -7,7 +7,7 @@ from typing import Any
 
 import pandas as pd
 
-from .config import LATEST_JSON, LATEST_MARKET_CSV, LATEST_SELECTED_CSV
+from config import LATEST_JSON, LATEST_MARKET_CSV, LATEST_SELECTED_CSV
 
 
 def dataframe_to_records(df: pd.DataFrame) -> list[dict[str, Any]]:
