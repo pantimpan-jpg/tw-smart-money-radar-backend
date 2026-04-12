@@ -13,13 +13,22 @@ def get_all_taiwan_stocks():
         and str(getattr(info, "code", "")).isdigit()
         and len(str(getattr(info, "code", ""))) == 4
     ]
-
+    
 def fetch_one_stock(info):
+    code = getattr(info, "code", "unknown")
+    name = getattr(info, "name", "")
+
     try:
-        stock = twstock.Stock(info.code)
+        print(f"[FETCH][ONE] Start {code} {name}")
+
+        stock = twstock.Stock(code)
+        print(f"[FETCH][ONE] Created stock object {code}")
+
         hist = stock.fetch_from(2025, 1)
+        print(f"[FETCH][ONE] Fetched history {code}, rows={0 if not hist else len(hist)}")
 
         if not hist or len(hist) < 60:
+            print(f"[FETCH][ONE] Skip {code}: not enough history")
             return None
 
         df = pd.DataFrame(
@@ -38,6 +47,7 @@ def fetch_one_stock(info):
         )
 
         if df.empty or len(df) < 60:
+            print(f"[FETCH][ONE] Skip {code}: dataframe too short")
             return None
 
         df = df.sort_values("date").reset_index(drop=True)
@@ -90,9 +100,9 @@ def fetch_one_stock(info):
         platform_high_20d = float(df["high"].rolling(20).max().iloc[-2]) if len(df) >= 21 else 0
         platform_high_60d = float(df["high"].rolling(60).max().iloc[-2]) if len(df) >= 61 else 0
 
-        return {
-            "stock_id": str(info.code),
-            "name": str(info.name),
+        result = {
+            "stock_id": str(code),
+            "name": str(name),
             "group": str(getattr(info, "group", "")),
             "close": close,
             "volume": volume,
@@ -114,8 +124,11 @@ def fetch_one_stock(info):
             "platform_high_60d": platform_high_60d,
         }
 
+        print(f"[FETCH][ONE] Done {code} {name}")
+        return result
+
     except Exception as e:
-        print(f"[FETCH][ERROR] {getattr(info, 'code', 'unknown')} {getattr(info, 'name', '')}: {e}")
+        print(f"[FETCH][ERROR] {code} {name}: {e}")
         return None
         
 def fetch_market_snapshot_parallel(progress_every: int = 20, batch_size: int = 20) -> pd.DataFrame:
