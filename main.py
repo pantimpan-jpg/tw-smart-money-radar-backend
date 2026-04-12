@@ -6,9 +6,9 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from .config import APP_NAME
-from .scanner import run_scan
-from .storage import load_snapshot
+from config import APP_NAME
+from scanner import run_scan
+from storage import load_snapshot
 
 app = FastAPI(title=APP_NAME)
 
