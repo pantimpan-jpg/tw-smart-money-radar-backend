@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import twstock
 
-from .config import (
+from config import (
     EXCLUDE_ETF_ETN,
     EXCLUDE_FINANCIAL,
     EXCLUDE_INDEX,
