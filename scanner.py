@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .config import (
+from config import (
     BROKER_TRACK_COUNT,
     INSTITUTIONAL_CSV,
     MAX_DISTANCE_FROM_MA20,
@@ -17,9 +17,9 @@ from .config import (
     TOP30_COUNT,
     WATCHLIST_COUNT,
 )
-from .fetcher import fetch_market_snapshot_parallel
-from .finmind_client import get_broker_data, get_institutional_data, get_revenue_data
-from .storage import dataframe_to_records, save_snapshot
+from fetcher import fetch_market_snapshot_parallel
+from finmind_client import get_broker_data, get_institutional_data, get_revenue_data
+from storage import dataframe_to_records, save_snapshot
 
 
 def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
