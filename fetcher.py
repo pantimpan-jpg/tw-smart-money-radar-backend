@@ -3,6 +3,8 @@ from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 import twstock
 
+MAX_WORKERS = 12
+
 def get_all_taiwan_stocks():
     return [
         info
