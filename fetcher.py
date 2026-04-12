@@ -1,9 +1,14 @@
+from __future__ import annotations
+
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
 import pandas as pd
 import twstock
 
 MAX_WORKERS = 12
+
 
 def get_all_taiwan_stocks():
     return [
@@ -13,7 +18,8 @@ def get_all_taiwan_stocks():
         and str(getattr(info, "code", "")).isdigit()
         and len(str(getattr(info, "code", ""))) == 4
     ]
-    
+
+
 def fetch_one_stock(info):
     code = getattr(info, "code", "unknown")
     name = getattr(info, "name", "")
@@ -95,7 +101,7 @@ def fetch_one_stock(info):
             else:
                 obv.append(obv[-1])
         df["obv"] = obv
-        obv_trend = 1 if df["obv"].iloc[-1] > df["obv"].iloc[-5] else 0
+        obv_trend = 1 if len(df) >= 5 and df["obv"].iloc[-1] > df["obv"].iloc[-5] else 0
 
         platform_high_20d = float(df["high"].rolling(20).max().iloc[-2]) if len(df) >= 21 else 0
         platform_high_60d = float(df["high"].rolling(60).max().iloc[-2]) if len(df) >= 61 else 0
@@ -130,7 +136,8 @@ def fetch_one_stock(info):
     except Exception as e:
         print(f"[FETCH][ERROR] {code} {name}: {e}")
         return None
-        
+
+
 def fetch_market_snapshot_parallel(progress_every: int = 20, batch_size: int = 20) -> pd.DataFrame:
     print("[FETCH] Loading Taiwan stock list...")
     codes = get_all_taiwan_stocks()
