@@ -17,13 +17,22 @@ def dataframe_to_records(df: pd.DataFrame) -> list[dict[str, Any]]:
     return clean.to_dict(orient="records")
 
 
+def ensure_parent_dir(path: Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
 def save_snapshot(payload: dict[str, Any], raw_df: pd.DataFrame, selected_df: pd.DataFrame) -> None:
+    ensure_parent_dir(Path(LATEST_JSON))
+    ensure_parent_dir(Path(LATEST_MARKET_CSV))
+    ensure_parent_dir(Path(LATEST_SELECTED_CSV))
+
     wrapped_payload = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "data": payload,
     }
 
-    LATEST_JSON.write_text(
+    Path(LATEST_JSON).write_text(
         json.dumps(wrapped_payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -45,7 +54,6 @@ def load_snapshot() -> dict[str, Any] | None:
     except Exception:
         return None
 
-    # 向下相容：如果舊格式沒有包 data / updated_at，就自動補成新格式
     if "data" not in data:
         return {
             "updated_at": data.get("generated_at") or datetime.now(timezone.utc).isoformat(),
