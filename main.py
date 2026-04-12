@@ -4,12 +4,12 @@ import threading
 import traceback
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from zoneinfo import ZoneInfo
 
 from config import APP_NAME
 from scanner import run_scan
@@ -106,8 +106,6 @@ def get_latest_scan() -> dict[str, Any]:
 
 @app.post("/api/scan/run")
 def trigger_scan() -> dict[str, Any]:
-    global scan_running
-
     if scan_running:
         return {
             "ok": True,
