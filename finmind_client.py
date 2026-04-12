@@ -7,7 +7,7 @@ from typing import Optional
 import pandas as pd
 import requests
 
-from .config import (
+from config import (
     BROKER_CSV,
     CACHE_DIR,
     FINMIND_API_TOKEN,
