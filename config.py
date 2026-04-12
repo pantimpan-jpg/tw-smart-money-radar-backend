@@ -47,7 +47,10 @@ REVENUE_CSV = os.getenv("REVENUE_CSV", "revenue_data.csv")
 # FinMind
 # =========================
 FINMIND_API_TOKEN = os.getenv("FINMIND_API_TOKEN", "")
-FINMIND_BASE_URL = os.getenv("FINMIND_BASE_URL", "https://api.finmindtrade.com/api/v4/data")
+FINMIND_BASE_URL = os.getenv(
+    "FINMIND_BASE_URL",
+    "https://api.finmindtrade.com/api/v4/data",
+)
 
 # =========================
 # Storage
@@ -66,10 +69,6 @@ SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", str(DATA_DIR / "snapshots")))
 
 for p in [DATA_DIR, CACHE_DIR, SNAPSHOT_DIR]:
     p.mkdir(parents=True, exist_ok=True)
-
-LATEST_JSON = SNAPSHOT_DIR / "latest_scan.json"
-LATEST_MARKET_CSV = SNAPSHOT_DIR / "latest_market_snapshot.csv"
-LATEST_SELECTED_CSV = SNAPSHOT_DIR / "latest_selected_stocks.csv"
 
 LATEST_JSON = SNAPSHOT_DIR / "latest_scan.json"
 LATEST_MARKET_CSV = SNAPSHOT_DIR / "latest_market_snapshot.csv"
