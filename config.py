@@ -51,14 +51,25 @@ FINMIND_BASE_URL = os.getenv("FINMIND_BASE_URL", "https://api.finmindtrade.com/a
 
 # =========================
 # Storage
+# Render persistent disk mount path: /var/data
+# Local dev fallback: project_root/data
 # =========================
-BASE_DIR = Path(os.getenv("BASE_DIR", Path(__file__).resolve().parents[1]))
-DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))
-CACHE_DIR = Path(os.getenv("CACHE_DIR", DATA_DIR / "cache"))
-SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", DATA_DIR / "snapshots"))
+BASE_DIR = Path(__file__).resolve().parent
+
+DEFAULT_DATA_DIR = Path("/var/data")
+if not DEFAULT_DATA_DIR.exists():
+    DEFAULT_DATA_DIR = BASE_DIR / "data"
+
+DATA_DIR = Path(os.getenv("DATA_DIR", str(DEFAULT_DATA_DIR)))
+CACHE_DIR = Path(os.getenv("CACHE_DIR", str(DATA_DIR / "cache")))
+SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", str(DATA_DIR / "snapshots")))
 
 for p in [DATA_DIR, CACHE_DIR, SNAPSHOT_DIR]:
     p.mkdir(parents=True, exist_ok=True)
+
+LATEST_JSON = SNAPSHOT_DIR / "latest_scan.json"
+LATEST_MARKET_CSV = SNAPSHOT_DIR / "latest_market_snapshot.csv"
+LATEST_SELECTED_CSV = SNAPSHOT_DIR / "latest_selected_stocks.csv"
 
 LATEST_JSON = SNAPSHOT_DIR / "latest_scan.json"
 LATEST_MARKET_CSV = SNAPSHOT_DIR / "latest_market_snapshot.csv"
