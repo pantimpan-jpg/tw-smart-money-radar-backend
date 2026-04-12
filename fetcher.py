@@ -7,7 +7,10 @@ from typing import Any
 import pandas as pd
 import twstock
 
-MAX_WORKERS = 12
+MAX_WORKERS = 6
+
+# 先用 5 檔大型股驗證整個流程
+TEST_STOCKS = ["2330", "2317", "2454", "2382", "1301"]
 
 
 def get_all_taiwan_stocks():
@@ -18,6 +21,11 @@ def get_all_taiwan_stocks():
         and str(getattr(info, "code", "")).isdigit()
         and len(str(getattr(info, "code", ""))) == 4
     ]
+
+
+def get_test_stocks():
+    all_codes = get_all_taiwan_stocks()
+    return [x for x in all_codes if str(x.code) in TEST_STOCKS]
 
 
 def fetch_one_stock(info):
@@ -138,9 +146,9 @@ def fetch_one_stock(info):
         return None
 
 
-def fetch_market_snapshot_parallel(progress_every: int = 20, batch_size: int = 20) -> pd.DataFrame:
+def fetch_market_snapshot_parallel(progress_every: int = 5, batch_size: int = 5) -> pd.DataFrame:
     print("[FETCH] Loading Taiwan stock list...")
-    codes = get_all_taiwan_stocks()
+    codes = get_test_stocks()
     total = len(codes)
 
     print(f"[FETCH] Total stock universe: {total}")
@@ -191,7 +199,7 @@ def fetch_market_snapshot_parallel(progress_every: int = 20, batch_size: int = 2
                         print(f"[FETCH][ERROR] {info.code} {info.name}: {e}")
 
         if future_map:
-            for future, info in future_map.items():
+            for _, info in future_map.items():
                 failed += 1
                 print(f"[FETCH][TIMEOUT] {info.code} {info.name}: batch timeout")
             future_map.clear()
