@@ -31,6 +31,35 @@ scan_running = False
 last_scan_error: str | None = None
 last_finished_at: str | None = None
 scan_lock = threading.Lock()
+progress_lock = threading.Lock()
+
+scan_progress: dict[str, Any] = {
+    "scan_running": False,
+    "percent": 0,
+    "stage": "idle",
+    "message": "尚未開始掃描",
+    "processed": 0,
+    "total": 0,
+    "success": 0,
+    "failed": 0,
+    "skipped": 0,
+    "last_scan_error": None,
+    "last_updated": None,
+}
+
+
+def update_scan_progress(**kwargs) -> None:
+    with progress_lock:
+        scan_progress.update(kwargs)
+
+
+def get_scan_progress_snapshot() -> dict[str, Any]:
+    with progress_lock:
+        return dict(scan_progress)
+
+
+def progress_callback(payload: dict[str, Any]) -> None:
+    update_scan_progress(**payload)
 
 
 def _run_scan_job() -> None:
@@ -43,19 +72,49 @@ def _run_scan_job() -> None:
         scan_running = True
 
     last_scan_error = None
+    update_scan_progress(
+        scan_running=True,
+        percent=0,
+        stage="prepare",
+        message="準備開始掃描",
+        processed=0,
+        total=0,
+        success=0,
+        failed=0,
+        skipped=0,
+        last_scan_error=None,
+    )
 
     try:
         print("[SCAN] === Starting scan job ===")
-        result = run_scan(save=True)
+        result = run_scan(save=True, progress_callback=progress_callback)
         last_finished_at = datetime.now(timezone.utc).isoformat()
+
+        update_scan_progress(
+            scan_running=False,
+            percent=100,
+            stage="completed",
+            message="掃描完成",
+            last_updated=last_finished_at,
+            last_scan_error=None,
+        )
+
         print("[SCAN] === Scan completed successfully ===")
         if isinstance(result, dict):
             print(f"[SCAN] Result keys: {list(result.keys())}")
+
     except Exception as e:
         last_scan_error = str(e)
+        update_scan_progress(
+            scan_running=False,
+            stage="error",
+            message=f"掃描失敗：{e}",
+            last_scan_error=str(e),
+        )
         print("[SCAN] === Scan failed ===")
         print(f"[SCAN] Error: {e}")
         print(traceback.format_exc())
+
     finally:
         scan_running = False
         print("[SCAN] === Scan thread finished ===")
@@ -107,9 +166,11 @@ def get_latest_scan() -> dict[str, Any]:
 @app.post("/api/scan/run")
 def trigger_scan() -> dict[str, Any]:
     if scan_running:
+        current = get_scan_progress_snapshot()
         return {
             "ok": True,
             "message": "掃描已在執行中",
+            "status": current,
         }
 
     print("[API] Manual trigger received")
@@ -119,7 +180,7 @@ def trigger_scan() -> dict[str, Any]:
 
     return {
         "ok": True,
-        "message": "已啟動背景掃描，請稍後查看 /api/scan/latest",
+        "message": "已啟動背景掃描，請稍後查看 /api/scan/status",
     }
 
 
@@ -128,11 +189,12 @@ def get_scan_status() -> dict[str, Any]:
     snapshot = load_snapshot()
     updated_at = snapshot.get("updated_at") if snapshot else None
 
-    return {
-        "scan_running": scan_running,
-        "last_scan_error": last_scan_error,
-        "last_updated": updated_at or last_finished_at,
-    }
+    status = get_scan_progress_snapshot()
+    status["scan_running"] = scan_running
+    status["last_scan_error"] = last_scan_error
+    status["last_updated"] = updated_at or last_finished_at or status.get("last_updated")
+
+    return status
 
 
 @app.get("/api/scan/top30")
@@ -183,7 +245,7 @@ def search_stocks(
         hay = f"{row.get('stock_id','')} {row.get('name','')} {row.get('group','')} {row.get('theme','')}".lower()
         if ql and ql not in hay:
             continue
-        if tag and row.get("radar_tag") != tag:
+        if tag and row.get("radar_tag") != tag and row.get("tag") != tag:
             continue
         if theme and row.get("theme") != theme:
             continue
