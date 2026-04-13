@@ -459,13 +459,36 @@ def build_payload(raw_df: pd.DataFrame, analyzed_df: pd.DataFrame) -> dict:
     return payload
 
 
-def run_scan(save: bool = True) -> dict:
+def run_scan(save: bool = True, progress_callback=None) -> dict:
+    if progress_callback:
+        progress_callback(
+            {
+                "stage": "prepare",
+                "percent": 0,
+                "message": "準備掃描",
+                "processed": 0,
+                "total": 0,
+                "success": 0,
+                "failed": 0,
+                "skipped": 0,
+            }
+        )
+
     print("[SCAN] Step 1: fetch market snapshot")
-    raw_df = fetch_market_snapshot_parallel()
+    raw_df = fetch_market_snapshot_parallel(progress_callback=progress_callback)
     print(f"[SCAN] Market snapshot rows: {len(raw_df)}")
 
     if raw_df.empty:
         raise RuntimeError("抓不到市場資料")
+
+    if progress_callback:
+        progress_callback(
+            {
+                "stage": "filter",
+                "percent": 88,
+                "message": "第一層快篩中",
+            }
+        )
 
     print("[SCAN] Step 2: first stage filter")
     stage1_df = first_stage_filter(raw_df)
@@ -474,9 +497,27 @@ def run_scan(save: bool = True) -> dict:
     if stage1_df.empty:
         raise RuntimeError("第一層快篩後沒有股票")
 
+    if progress_callback:
+        progress_callback(
+            {
+                "stage": "merge",
+                "percent": 92,
+                "message": "合併法人 / 分點 / 營收資料",
+            }
+        )
+
     print("[SCAN] Step 3: merge external data")
     stage2_input = merge_external_data(stage1_df)
     print(f"[SCAN] Stage2 rows: {len(stage2_input)}")
+
+    if progress_callback:
+        progress_callback(
+            {
+                "stage": "score",
+                "percent": 96,
+                "message": "計算分數中",
+            }
+        )
 
     print("[SCAN] Step 4: calculate scores")
     analyzed_df = calculate_scores(stage2_input)
@@ -486,13 +527,40 @@ def run_scan(save: bool = True) -> dict:
     ).reset_index(drop=True)
     print(f"[SCAN] Final analyzed rows: {len(analyzed_df)}")
 
+    if progress_callback:
+        progress_callback(
+            {
+                "stage": "payload",
+                "percent": 98,
+                "message": "建立結果資料中",
+            }
+        )
+
     print("[SCAN] Step 5: build payload")
     payload = build_payload(raw_df, analyzed_df)
 
     if save:
+        if progress_callback:
+            progress_callback(
+                {
+                    "stage": "save",
+                    "percent": 99,
+                    "message": "儲存掃描結果中",
+                }
+            )
+
         print("[SCAN] Step 6: save snapshot")
         save_snapshot(payload, raw_df, analyzed_df)
         print("[SCAN] Snapshot saved")
+
+    if progress_callback:
+        progress_callback(
+            {
+                "stage": "done",
+                "percent": 100,
+                "message": "掃描完成",
+            }
+        )
 
     print("[SCAN] run_scan completed")
     return payload
