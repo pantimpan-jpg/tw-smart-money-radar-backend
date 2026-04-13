@@ -44,6 +44,7 @@ def classify_theme(name: str, group: str) -> str:
     cpo_keywords = ["CPO", "矽光子", "光通訊", "光模組"]
     ai_keywords = ["AI", "伺服器", "GPU", "ASIC"]
     satellite_keywords = ["低軌", "衛星", "天線", "通訊"]
+
     if any(k.upper() in text for k in pcb_keywords):
         return "PCB"
     if any(k.upper() in text for k in thermal_keywords):
@@ -70,8 +71,15 @@ def merge_external_data(df: pd.DataFrame) -> pd.DataFrame:
 
     if not institutional.empty:
         required = [
-            "stock_id", "foreign_buy_days", "investment_buy_days", "dealer_buy_days",
-            "foreign_buy", "trust_buy", "dealer_buy", "trust_holding_pct", "estimated_inst_cost",
+            "stock_id",
+            "foreign_buy_days",
+            "investment_buy_days",
+            "dealer_buy_days",
+            "foreign_buy",
+            "trust_buy",
+            "dealer_buy",
+            "trust_holding_pct",
+            "estimated_inst_cost",
         ]
         missing = [c for c in required if c not in institutional.columns]
         if missing:
@@ -80,8 +88,14 @@ def merge_external_data(df: pd.DataFrame) -> pd.DataFrame:
         out = out.merge(institutional[required], on="stock_id", how="left")
     else:
         for col in [
-            "foreign_buy_days", "investment_buy_days", "dealer_buy_days",
-            "foreign_buy", "trust_buy", "dealer_buy", "trust_holding_pct", "estimated_inst_cost"
+            "foreign_buy_days",
+            "investment_buy_days",
+            "dealer_buy_days",
+            "foreign_buy",
+            "trust_buy",
+            "dealer_buy",
+            "trust_holding_pct",
+            "estimated_inst_cost",
         ]:
             out[col] = 0.0
 
@@ -116,9 +130,18 @@ def merge_external_data(df: pd.DataFrame) -> pd.DataFrame:
         out["revenue_mom"] = 0.0
 
     fill_zero_cols = [
-        "foreign_buy_days", "investment_buy_days", "dealer_buy_days",
-        "foreign_buy", "trust_buy", "dealer_buy", "trust_holding_pct", "estimated_inst_cost",
-        "main_force_10d", "broker_buy_5d", "revenue_yoy", "revenue_mom",
+        "foreign_buy_days",
+        "investment_buy_days",
+        "dealer_buy_days",
+        "foreign_buy",
+        "trust_buy",
+        "dealer_buy",
+        "trust_holding_pct",
+        "estimated_inst_cost",
+        "main_force_10d",
+        "broker_buy_5d",
+        "revenue_yoy",
+        "revenue_mom",
     ]
     for col in fill_zero_cols:
         out[col] = out[col].fillna(0)
@@ -140,42 +163,49 @@ def calc_institution_score(row: pd.Series) -> float:
         score += 10
     elif row["investment_buy_days"] >= 2:
         score += 6
+
     if row["foreign_buy_days"] >= 5:
         score += 10
     elif row["foreign_buy_days"] >= 3:
         score += 7
     elif row["foreign_buy_days"] >= 2:
         score += 4
+
     if row["dealer_buy_days"] >= 5:
         score += 4
     elif row["dealer_buy_days"] >= 3:
         score += 2
     elif row["dealer_buy_days"] >= 2:
         score += 1
+
     if row["institution_force"] >= 0.12:
         score += 12
     elif row["institution_force"] >= 0.08:
         score += 8
     elif row["institution_force"] >= 0.05:
         score += 4
+
     if row["trust_force"] >= 0.08:
         score += 10
     elif row["trust_force"] >= 0.05:
         score += 6
     elif row["trust_force"] >= 0.03:
         score += 3
+
     if 1 <= row["trust_holding_pct"] <= 3:
         score += 8
     elif 3 < row["trust_holding_pct"] <= 8:
         score += 5
     elif row["trust_holding_pct"] > 15:
         score -= 6
+
     if row["estimated_inst_cost"] > 0:
         diff_pct = abs(row["close"] - row["estimated_inst_cost"]) / row["estimated_inst_cost"] * 100
         if diff_pct <= 3:
             score += 8
         elif diff_pct <= 5:
             score += 4
+
     return score
 
 
@@ -216,15 +246,18 @@ def calc_revenue_score(row: pd.Series) -> float:
         score += 10
     elif row["revenue_yoy"] >= 15:
         score += 6
+
     if row["revenue_mom"] >= 10:
         score += 5
     elif row["revenue_mom"] >= 5:
         score += 3
+
     return score
 
 
 def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+
     out["tech_score"] = 0.0
     out.loc[out["close"] > out["ma20"], "tech_score"] += 5
     out.loc[out["close"] > out["ma60"], "tech_score"] += 8
@@ -262,6 +295,7 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
     out["broker_score"] = out.apply(calc_broker_score, axis=1)
     out["breakout_score"] = out.apply(calc_breakout_score, axis=1)
     out["revenue_score"] = out.apply(calc_revenue_score, axis=1)
+
     out["score_total"] = (
         out["tech_score"]
         + out["institution_score"]
@@ -270,28 +304,54 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
         + out["breakout_score"]
         + out["revenue_score"]
     )
-    out["radar_tag"] = np.where(out["score_starting"] >= out["score_second_wave"], "剛啟動", "可能第二波")
+
+    out["radar_tag"] = np.where(
+        out["score_starting"] >= out["score_second_wave"],
+        "剛啟動",
+        "可能第二波",
+    )
     return out
+
+
+def build_table_rows(df: pd.DataFrame) -> list[dict]:
+    if df.empty:
+        return []
+
+    out = df.copy()
+
+    # 對齊前端欄位名稱
+    out["score"] = out["score_total"]
+    out["tag"] = out["radar_tag"]
+
+    return dataframe_to_records(out)
 
 
 def build_payload(raw_df: pd.DataFrame, analyzed_df: pd.DataFrame) -> dict:
     top30_df = analyzed_df.head(TOP30_COUNT).copy()
     watchlist_df = analyzed_df.iloc[TOP30_COUNT:TOP30_COUNT + WATCHLIST_COUNT].copy()
+
     starting_df = analyzed_df[analyzed_df["radar_tag"] == "剛啟動"].sort_values(
-        ["score_starting", "score_total"], ascending=False
+        ["score_starting", "score_total"],
+        ascending=False,
     ).head(TOP30_COUNT).copy()
+
     second_wave_df = analyzed_df[analyzed_df["radar_tag"] == "可能第二波"].sort_values(
-        ["score_second_wave", "score_total"], ascending=False
+        ["score_second_wave", "score_total"],
+        ascending=False,
     ).head(TOP30_COUNT).copy()
+
     broker_track_df = analyzed_df.sort_values(
-        ["broker_score", "main_force_score", "score_total"], ascending=False
+        ["broker_score", "main_force_score", "score_total"],
+        ascending=False,
     ).head(BROKER_TRACK_COUNT).copy()
 
     risk_overheated_df = analyzed_df[
         (analyzed_df["volume_ratio"] >= 2.5) & (analyzed_df["rsi"] >= 70)
     ].head(20).copy()
+
     high_turnover_df = analyzed_df.sort_values(
-        ["turnover_100m", "volume_ratio"], ascending=False
+        ["turnover_100m", "volume_ratio"],
+        ascending=False,
     ).head(20).copy()
 
     payload = {
@@ -302,14 +362,14 @@ def build_payload(raw_df: pd.DataFrame, analyzed_df: pd.DataFrame) -> dict:
             "second_wave_count": int(len(second_wave_df)),
             "overheated_count": int(len(risk_overheated_df)),
         },
-        "top30": dataframe_to_records(top30_df),
-        "watchlist": dataframe_to_records(watchlist_df),
-        "starting": dataframe_to_records(starting_df),
-        "second_wave": dataframe_to_records(second_wave_df),
-        "broker_track": dataframe_to_records(broker_track_df),
-        "overheated": dataframe_to_records(risk_overheated_df),
-        "high_turnover": dataframe_to_records(high_turnover_df),
-        "all_selected": dataframe_to_records(analyzed_df),
+        "top30": build_table_rows(top30_df),
+        "watchlist": build_table_rows(watchlist_df),
+        "starting": build_table_rows(starting_df),
+        "second_wave": build_table_rows(second_wave_df),
+        "broker_track": build_table_rows(broker_track_df),
+        "overheated": build_table_rows(risk_overheated_df),
+        "high_turnover": build_table_rows(high_turnover_df),
+        "all_selected": build_table_rows(analyzed_df),
     }
     return payload
 
@@ -337,7 +397,7 @@ def run_scan(save: bool = True) -> dict:
     analyzed_df = calculate_scores(stage2_input)
     analyzed_df = analyzed_df.sort_values(
         ["score_total", "turnover_100m", "volume_ratio"],
-        ascending=False
+        ascending=False,
     ).reset_index(drop=True)
     print(f"[SCAN] Final analyzed rows: {len(analyzed_df)}")
 
