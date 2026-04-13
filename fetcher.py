@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -53,6 +53,15 @@ def get_scan_stocks():
 
     print("[FETCH] FULL MARKET MODE ON: using all Taiwan listed/OTC stocks")
     return get_all_taiwan_stocks()
+
+
+def emit_progress(progress_callback: Callable[[dict[str, Any]], None] | None, payload: dict[str, Any]) -> None:
+    if not progress_callback:
+        return
+    try:
+        progress_callback(payload)
+    except Exception as e:
+        print(f"[FETCH][PROGRESS-ERROR] {e}")
 
 
 def fetch_history_with_retry(code: str):
@@ -182,22 +191,47 @@ def fetch_one_stock(info) -> dict[str, Any] | None:
         raise RuntimeError(f"{code} {name}: {e}") from e
 
 
-def fetch_failed_stocks_once(failed_infos: list[Any]) -> list[dict[str, Any]]:
+def fetch_failed_stocks_once(
+    failed_infos: list[Any],
+    success: int,
+    failed: int,
+    skipped: int,
+    total: int,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> list[dict[str, Any]]:
     if not failed_infos:
         return []
 
     recovered_rows: list[dict[str, Any]] = []
-    print(f"[FETCH] Retry failed stocks once: {len(failed_infos)}")
+    retry_total = len(failed_infos)
 
-    for info in failed_infos:
+    print(f"[FETCH] Retry failed stocks once: {retry_total}")
+
+    for idx, info in enumerate(failed_infos, start=1):
         code = getattr(info, "code", "unknown")
         name = getattr(info, "name", "")
+
         try:
             result = fetch_one_stock(info)
             if result:
                 recovered_rows.append(result)
         except Exception as e:
             print(f"[FETCH][RETRY-ERROR] {code} {name}: {e}")
+
+        retry_percent = 80 + int((idx / retry_total) * 5)
+        emit_progress(
+            progress_callback,
+            {
+                "stage": "fetch_retry",
+                "percent": min(retry_percent, 85),
+                "message": f"補跑失敗股票中 {idx}/{retry_total}",
+                "processed": success + failed + skipped,
+                "total": total,
+                "success": success + len(recovered_rows),
+                "failed": max(failed - len(recovered_rows), 0),
+                "skipped": skipped,
+            },
+        )
 
     print(f"[FETCH] Retry recovered rows: {len(recovered_rows)}")
     return recovered_rows
@@ -206,6 +240,7 @@ def fetch_failed_stocks_once(failed_infos: list[Any]) -> list[dict[str, Any]]:
 def fetch_market_snapshot_parallel(
     progress_every: int = PROGRESS_EVERY,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> pd.DataFrame:
     print("[FETCH] Loading Taiwan stock list...")
     codes = get_scan_stocks()
@@ -222,6 +257,20 @@ def fetch_market_snapshot_parallel(
     skipped = 0
 
     start_time = time.time()
+
+    emit_progress(
+        progress_callback,
+        {
+            "stage": "fetch",
+            "percent": 0,
+            "message": "開始抓取全市場資料",
+            "processed": 0,
+            "total": total,
+            "success": 0,
+            "failed": 0,
+            "skipped": 0,
+        },
+    )
 
     for batch_start in range(0, total, batch_size):
         batch = codes[batch_start: batch_start + batch_size]
@@ -262,8 +311,30 @@ def fetch_market_snapshot_parallel(
                 f"elapsed={elapsed}s"
             )
 
-    # 補跑一次失敗股票
-    recovered_rows = fetch_failed_stocks_once(failed_infos)
+        fetch_percent = min(80, int((processed / total) * 80)) if total > 0 else 0
+        emit_progress(
+            progress_callback,
+            {
+                "stage": "fetch",
+                "percent": fetch_percent,
+                "message": f"抓取市場資料中 {processed}/{total}",
+                "processed": processed,
+                "total": total,
+                "success": success,
+                "failed": failed,
+                "skipped": skipped,
+            },
+        )
+
+    recovered_rows = fetch_failed_stocks_once(
+        failed_infos=failed_infos,
+        success=success,
+        failed=failed,
+        skipped=skipped,
+        total=total,
+        progress_callback=progress_callback,
+    )
+
     if recovered_rows:
         rows.extend(recovered_rows)
         success += len(recovered_rows)
@@ -285,4 +356,19 @@ def fetch_market_snapshot_parallel(
     df = df.drop_duplicates(subset=["stock_id"], keep="last").reset_index(drop=True)
 
     print(f"[FETCH] Final dataframe rows: {len(df)}")
+
+    emit_progress(
+        progress_callback,
+        {
+            "stage": "fetch_done",
+            "percent": 85,
+            "message": "市場資料抓取完成",
+            "processed": total,
+            "total": total,
+            "success": success,
+            "failed": failed,
+            "skipped": skipped,
+        },
+    )
+
     return df
