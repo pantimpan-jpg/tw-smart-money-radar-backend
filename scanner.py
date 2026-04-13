@@ -313,17 +313,102 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def build_reason_and_targets(row: pd.Series) -> dict:
+    reasons: list[str] = []
+
+    if row.get("radar_tag") == "剛啟動":
+        reasons.append("型態偏剛啟動，仍在起漲初段")
+    else:
+        reasons.append("型態偏第二波，屬強勢整理後再攻候選")
+
+    if row.get("institution_score", 0) >= 12:
+        reasons.append("法人籌碼加分明顯")
+    elif row.get("institution_score", 0) >= 6:
+        reasons.append("法人買盤有延續")
+
+    if row.get("main_force_score", 0) >= 10:
+        reasons.append("主力近10日累積明顯")
+    elif row.get("main_force_score", 0) >= 6:
+        reasons.append("主力有偏多痕跡")
+
+    if row.get("broker_score", 0) >= 8:
+        reasons.append("分點買盤偏強")
+    elif row.get("broker_score", 0) >= 5:
+        reasons.append("分點有短線加分")
+
+    if row.get("breakout_score", 0) >= 15:
+        reasons.append("突破中期平台高點")
+    elif row.get("breakout_score", 0) >= 10:
+        reasons.append("突破短期平台高點")
+
+    if row.get("revenue_score", 0) >= 10:
+        reasons.append("營收成長動能強")
+    elif row.get("revenue_score", 0) >= 5:
+        reasons.append("營收成長具支撐")
+
+    if row.get("volume_ratio", 0) >= 2:
+        reasons.append("量比放大，資金關注提高")
+    elif row.get("volume_ratio", 0) >= 1.5:
+        reasons.append("量能優於均值")
+
+    if row.get("close", 0) > row.get("ma20", 0) > 0:
+        reasons.append("站上 MA20")
+    if row.get("close", 0) > row.get("ma60", 0) > 0:
+        reasons.append("站上 MA60")
+    if row.get("macd", 0) > row.get("macd_signal", 0):
+        reasons.append("MACD 偏多")
+    if row.get("obv_trend", 0) > 0:
+        reasons.append("OBV 走升")
+
+    close = float(row.get("close", 0) or 0)
+    ph20 = float(row.get("platform_high_20d", 0) or 0)
+    ph60 = float(row.get("platform_high_60d", 0) or 0)
+    boll_upper = float(row.get("boll_upper", 0) or 0)
+
+    resistance_candidates = [x for x in [ph20, ph60, boll_upper] if x > 0]
+    resistance_candidates = sorted(set(round(x, 2) for x in resistance_candidates))
+
+    if resistance_candidates:
+        above_close = [x for x in resistance_candidates if x >= close]
+        if above_close:
+            resistance_low = above_close[0]
+            resistance_high = above_close[1] if len(above_close) >= 2 else round(resistance_low * 1.03, 2)
+        else:
+            resistance_low = max(resistance_candidates)
+            resistance_high = round(resistance_low * 1.05, 2)
+    else:
+        resistance_low = round(close * 1.05, 2)
+        resistance_high = round(close * 1.08, 2)
+
+    target_price = round((resistance_low + resistance_high) / 2, 2)
+
+    short_reasons = reasons[:4]
+    reason_text = "；".join(short_reasons) if short_reasons else "符合模型條件"
+
+    return {
+        "reason_text": reason_text,
+        "reason_list": reasons[:8],
+        "target_price": target_price,
+        "resistance_low": round(resistance_low, 2),
+        "resistance_high": round(resistance_high, 2),
+    }
+
+
 def build_table_rows(df: pd.DataFrame) -> list[dict]:
     if df.empty:
         return []
 
     out = df.copy()
-
-    # 對齊前端欄位名稱
     out["score"] = out["score_total"]
     out["tag"] = out["radar_tag"]
 
-    return dataframe_to_records(out)
+    records = dataframe_to_records(out)
+
+    for row in records:
+        extra = build_reason_and_targets(pd.Series(row))
+        row.update(extra)
+
+    return records
 
 
 def build_payload(raw_df: pd.DataFrame, analyzed_df: pd.DataFrame) -> dict:
