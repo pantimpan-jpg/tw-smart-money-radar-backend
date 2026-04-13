@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -7,9 +8,13 @@ from typing import Any
 import pandas as pd
 import twstock
 
-MAX_WORKERS = 6
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "6"))
 
-# 先用 5 檔大型股驗證整個流程
+# 預設改成全市場掃描
+# 若之後要快速測試，可把環境變數 USE_TEST_STOCKS=true
+USE_TEST_STOCKS = os.getenv("USE_TEST_STOCKS", "false").lower() == "true"
+
+# 測試用股票池（只有在 USE_TEST_STOCKS=true 時才會用到）
 TEST_STOCKS = ["2330", "2317", "2454", "2382", "1301"]
 
 
@@ -26,6 +31,15 @@ def get_all_taiwan_stocks():
 def get_test_stocks():
     all_codes = get_all_taiwan_stocks()
     return [x for x in all_codes if str(x.code) in TEST_STOCKS]
+
+
+def get_scan_stocks():
+    if USE_TEST_STOCKS:
+        print("[FETCH] TEST MODE ON: using test stocks only")
+        return get_test_stocks()
+
+    print("[FETCH] FULL MARKET MODE ON: using all Taiwan listed/OTC stocks")
+    return get_all_taiwan_stocks()
 
 
 def fetch_one_stock(info):
@@ -146,9 +160,9 @@ def fetch_one_stock(info):
         return None
 
 
-def fetch_market_snapshot_parallel(progress_every: int = 5, batch_size: int = 5) -> pd.DataFrame:
+def fetch_market_snapshot_parallel(progress_every: int = 50, batch_size: int = 20) -> pd.DataFrame:
     print("[FETCH] Loading Taiwan stock list...")
-    codes = get_test_stocks()
+    codes = get_scan_stocks()
     total = len(codes)
 
     print(f"[FETCH] Total stock universe: {total}")
@@ -174,7 +188,7 @@ def fetch_market_snapshot_parallel(progress_every: int = 5, batch_size: int = 5)
                 for info in batch
             }
 
-            batch_timeout = 60
+            batch_timeout = 120
             batch_begin_time = time.time()
 
             while future_map and (time.time() - batch_begin_time) < batch_timeout:
@@ -204,13 +218,15 @@ def fetch_market_snapshot_parallel(progress_every: int = 5, batch_size: int = 5)
                 print(f"[FETCH][TIMEOUT] {info.code} {info.name}: batch timeout")
             future_map.clear()
 
-        elapsed = round(time.time() - start_time, 1)
         processed = success + skipped + failed
-        print(
-            f"[FETCH] Progress {processed}/{total} | "
-            f"success={success} skipped={skipped} failed={failed} | "
-            f"elapsed={elapsed}s"
-        )
+        elapsed = round(time.time() - start_time, 1)
+
+        if processed % progress_every == 0 or processed == total:
+            print(
+                f"[FETCH] Progress {processed}/{total} | "
+                f"success={success} skipped={skipped} failed={failed} | "
+                f"elapsed={elapsed}s"
+            )
 
     total_elapsed = round(time.time() - start_time, 1)
 
