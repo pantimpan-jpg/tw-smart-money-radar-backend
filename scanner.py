@@ -261,6 +261,13 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
     out["pct_5d"] = 0.0
     out["pct_20d"] = 0.0
 
+    out["theme"] = out.apply(lambda x: classify_theme(str(x["name"]), str(x["group"])), axis=1)
+    out["institution_score"] = out.apply(calc_institution_score, axis=1)
+    out["main_force_score"] = out.apply(calc_main_force_score, axis=1)
+    out["broker_score"] = out.apply(calc_broker_score, axis=1)
+    out["breakout_score"] = out.apply(calc_breakout_score, axis=1)
+    out["revenue_score"] = out.apply(calc_revenue_score, axis=1)
+
     out["tech_score"] = 0.0
     out.loc[out["close"] > out["ma20"], "tech_score"] += 5
     out.loc[out["close"] > out["ma60"], "tech_score"] += 8
@@ -309,13 +316,6 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
     out.loc[out["main_force_score"] >= 6, "score_second_wave"] += 4
     out.loc[out["broker_score"] >= 5, "score_second_wave"] += 3
     out.loc[out["pct_from_ma20"] > 15, "score_second_wave"] -= 5
-
-    out["theme"] = out.apply(lambda x: classify_theme(str(x["name"]), str(x["group"])), axis=1)
-    out["institution_score"] = out.apply(calc_institution_score, axis=1)
-    out["main_force_score"] = out.apply(calc_main_force_score, axis=1)
-    out["broker_score"] = out.apply(calc_broker_score, axis=1)
-    out["breakout_score"] = out.apply(calc_breakout_score, axis=1)
-    out["revenue_score"] = out.apply(calc_revenue_score, axis=1)
 
     out["score_total"] = (
         out["tech_score"]
