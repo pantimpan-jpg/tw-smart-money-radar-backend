@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import traceback
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -12,7 +13,7 @@ from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from config import APP_NAME
+from config import APP_NAME, LATEST_MARKET_CSV
 from finmind_client import finmind_get, get_broker_data
 from scanner import run_scan
 from storage import load_snapshot
@@ -129,16 +130,24 @@ def get_snapshot_or_404() -> dict[str, Any]:
     return snapshot
 
 
+def load_market_snapshot_df() -> pd.DataFrame:
+    path = Path(LATEST_MARKET_CSV)
+    if not path.exists():
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+
+    if "stock_id" in df.columns:
+        df["stock_id"] = df["stock_id"].astype(str)
+
+    return df
+
+
 def get_all_selected_rows(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     return snapshot.get("data", {}).get("all_selected", [])
-
-
-def find_stock_row(snapshot: dict[str, Any], stock_id: str) -> dict[str, Any]:
-    rows = get_all_selected_rows(snapshot)
-    for row in rows:
-        if str(row.get("stock_id")) == str(stock_id):
-            return row
-    raise HTTPException(status_code=404, detail="找不到該股票")
 
 
 def safe_float(value: Any) -> float | None:
@@ -167,13 +176,6 @@ def to_lot_from_shares(value: Any) -> float | None:
     return num / 1000.0
 
 
-def signed_lot_int(value: Any) -> int | None:
-    num = to_lot_from_shares(value)
-    if num is None:
-        return None
-    return int(round(num))
-
-
 def latest_date_text(df: pd.DataFrame) -> str | None:
     if df.empty or "date" not in df.columns:
         return None
@@ -183,7 +185,31 @@ def latest_date_text(df: pd.DataFrame) -> str | None:
     return d.max().date().isoformat()
 
 
-def build_overview_from_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+def find_stock_context(snapshot: dict[str, Any], stock_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    stock_id = str(stock_id)
+
+    selected_rows = get_all_selected_rows(snapshot)
+    for row in selected_rows:
+        if str(row.get("stock_id")) == stock_id:
+            return row, {
+                "in_selected": True,
+                "source": "selected",
+            }
+
+    market_df = load_market_snapshot_df()
+    if not market_df.empty and "stock_id" in market_df.columns:
+        sub = market_df[market_df["stock_id"].astype(str) == stock_id]
+        if not sub.empty:
+            row = sub.iloc[0].to_dict()
+            return row, {
+                "in_selected": False,
+                "source": "market_snapshot",
+            }
+
+    raise HTTPException(status_code=404, detail="找不到該股票")
+
+
+def build_overview_from_row(row: dict[str, Any], *, in_selected: bool) -> dict[str, Any]:
     return {
         "stock_id": str(row.get("stock_id", "")),
         "stock_name": row.get("name") or row.get("stock_name") or str(row.get("stock_id", "")),
@@ -205,19 +231,19 @@ def build_overview_from_snapshot(row: dict[str, Any]) -> dict[str, Any]:
         "short_balance": None,
         "margin_change": None,
         "short_change": None,
-        "institution_score": safe_float(row.get("institution_score")),
-        "broker_score": safe_float(row.get("broker_score")),
-        "main_force_score": safe_float(row.get("main_force_score")),
-        "final_score": safe_float(row.get("score_total") or row.get("score")),
-        "technical_tag": row.get("tag"),
-        "radar_tag": row.get("radar_tag") or row.get("tag"),
+        "institution_score": safe_float(row.get("institution_score")) if in_selected else None,
+        "broker_score": safe_float(row.get("broker_score")) if in_selected else None,
+        "main_force_score": safe_float(row.get("main_force_score")) if in_selected else None,
+        "final_score": safe_float(row.get("score_total") or row.get("score")) if in_selected else None,
+        "technical_tag": row.get("tag") if in_selected else None,
+        "radar_tag": row.get("radar_tag") if in_selected else None,
         "support_price": None,
         "pressure_price": None,
     }
 
 
 def get_recent_price_df(stock_id: str) -> pd.DataFrame:
-    start_date = (date.today() - timedelta(days=60)).isoformat()
+    start_date = (date.today() - timedelta(days=120)).isoformat()
     return finmind_get("TaiwanStockPrice", stock_id, start_date)
 
 
@@ -259,10 +285,8 @@ def enrich_overview_with_price(overview: dict[str, Any], stock_id: str) -> None:
 
     if close_col and len(df) >= 20:
         close_series = pd.to_numeric(df[close_col], errors="coerce")
-        rolling_high = close_series.rolling(20).max().iloc[-1]
-        rolling_low = close_series.rolling(20).min().iloc[-1]
-        overview["pressure_price"] = safe_float(rolling_high)
-        overview["support_price"] = safe_float(rolling_low)
+        overview["pressure_price"] = safe_float(close_series.rolling(20).max().iloc[-1])
+        overview["support_price"] = safe_float(close_series.rolling(20).min().iloc[-1])
 
 
 def enrich_overview_with_per(stock_id: str, overview: dict[str, Any]) -> None:
@@ -303,10 +327,7 @@ def get_institutional_summary(stock_id: str) -> dict[str, Any]:
         "dealer": {"d1": None, "d5": None, "d10": None, "d20": None},
     }
 
-    if df.empty:
-        return empty_result
-
-    if "date" not in df.columns:
+    if df.empty or "date" not in df.columns:
         return empty_result
 
     name_col = None
@@ -345,8 +366,7 @@ def get_institutional_summary(stock_id: str) -> dict[str, Any]:
         if latest_sub.empty:
             return None
         if window == 1:
-            value = latest_sub.iloc[-1]["net_lot"]
-            return int(round(value))
+            return int(round(latest_sub.iloc[-1]["net_lot"]))
         recent_dates = all_dates[-window:]
         recent = latest_sub[latest_sub["date"].isin(recent_dates)]
         if recent.empty:
@@ -378,11 +398,9 @@ def get_institutional_summary(stock_id: str) -> dict[str, Any]:
 
 def enrich_overview_with_institutional(stock_id: str, overview: dict[str, Any]) -> dict[str, Any]:
     summary = get_institutional_summary(stock_id)
-
     overview["foreign_buy_sell"] = summary["foreign"]["d1"]
     overview["investment_trust_buy_sell"] = summary["trust"]["d1"]
     overview["dealer_buy_sell"] = summary["dealer"]["d1"]
-
     return summary
 
 
@@ -401,26 +419,24 @@ def get_margin_summary(stock_id: str) -> dict[str, Any]:
     if df.empty or "date" not in df.columns:
         return empty_result
 
+    if "MarginPurchaseTodayBalance" not in df.columns or "ShortSaleTodayBalance" not in df.columns:
+        return empty_result
+
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date"]).copy()
     if df.empty:
-        return empty_result
-
-    if "MarginPurchaseTodayBalance" not in df.columns or "ShortSaleTodayBalance" not in df.columns:
         return empty_result
 
     df["margin_balance"] = pd.to_numeric(df["MarginPurchaseTodayBalance"], errors="coerce")
     df["short_balance"] = pd.to_numeric(df["ShortSaleTodayBalance"], errors="coerce")
     df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
 
-    latest_idx = df.index[-1]
-    latest_date = df.loc[latest_idx, "date"]
+    latest_date = df.iloc[-1]["date"]
 
-    def calc_balance_change(col: str, days: int) -> int | None:
-        sub = df[["date", col]].dropna().copy()
+    def calc_change(col: str, days: int) -> int | None:
+        sub = df[["date", col]].dropna().copy().sort_values("date").reset_index(drop=True)
         if sub.empty:
             return None
-        sub = sub.sort_values("date").reset_index(drop=True)
         latest_value = sub.iloc[-1][col]
 
         if days == 1:
@@ -443,28 +459,26 @@ def get_margin_summary(stock_id: str) -> dict[str, Any]:
         "margin_balance": int(round(latest_margin_balance / 1000.0)) if pd.notna(latest_margin_balance) else None,
         "short_balance": int(round(latest_short_balance / 1000.0)) if pd.notna(latest_short_balance) else None,
         "margin": {
-            "d1": calc_balance_change("margin_balance", 1),
-            "d5": calc_balance_change("margin_balance", 5),
-            "d10": calc_balance_change("margin_balance", 10),
-            "d20": calc_balance_change("margin_balance", 20),
+            "d1": calc_change("margin_balance", 1),
+            "d5": calc_change("margin_balance", 5),
+            "d10": calc_change("margin_balance", 10),
+            "d20": calc_change("margin_balance", 20),
         },
         "short": {
-            "d1": calc_balance_change("short_balance", 1),
-            "d5": calc_balance_change("short_balance", 5),
-            "d10": calc_balance_change("short_balance", 10),
-            "d20": calc_balance_change("short_balance", 20),
+            "d1": calc_change("short_balance", 1),
+            "d5": calc_change("short_balance", 5),
+            "d10": calc_change("short_balance", 10),
+            "d20": calc_change("short_balance", 20),
         },
     }
 
 
 def enrich_overview_with_margin(stock_id: str, overview: dict[str, Any]) -> dict[str, Any]:
     summary = get_margin_summary(stock_id)
-
     overview["margin_balance"] = summary["margin_balance"]
     overview["short_balance"] = summary["short_balance"]
     overview["margin_change"] = summary["margin"]["d1"]
     overview["short_change"] = summary["short"]["d1"]
-
     return summary
 
 
@@ -474,9 +488,11 @@ def get_revenues_list(stock_id: str) -> list[dict[str, Any]]:
     if df.empty:
         return []
 
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.sort_values("date")
+    if "date" not in df.columns:
+        return []
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.sort_values("date")
 
     revenue_col = "revenue" if "revenue" in df.columns else None
     if revenue_col is None:
@@ -505,18 +521,15 @@ def get_eps_list(stock_id: str) -> list[dict[str, Any]]:
     if df.empty:
         return []
 
-    type_col = "type" if "type" in df.columns else None
-    value_col = "value" if "value" in df.columns else None
-    date_col = "date" if "date" in df.columns else None
-    if not type_col or not value_col or not date_col:
+    if "type" not in df.columns or "value" not in df.columns or "date" not in df.columns:
         return []
 
-    eps_df = df[df[type_col].astype(str).str.contains("基本每股盈餘", na=False)].copy()
+    eps_df = df[df["type"].astype(str).str.contains("基本每股盈餘", na=False)].copy()
     if eps_df.empty:
         return []
 
-    eps_df["date"] = pd.to_datetime(eps_df[date_col], errors="coerce")
-    eps_df["value_num"] = pd.to_numeric(eps_df[value_col], errors="coerce")
+    eps_df["date"] = pd.to_datetime(eps_df["date"], errors="coerce")
+    eps_df["value_num"] = pd.to_numeric(eps_df["value"], errors="coerce")
     eps_df = eps_df.dropna(subset=["date"]).sort_values("date")
 
     eps_df["yoy"] = eps_df["value_num"].pct_change(4) * 100
@@ -665,18 +678,28 @@ def get_broker_branches_list(stock_id: str) -> list[dict[str, Any]]:
     return out
 
 
+def build_stock_meta(stock_id: str, *, in_selected: bool, source: str) -> dict[str, Any]:
+    return {
+        "stock_id": stock_id,
+        "in_selected": in_selected,
+        "source": source,
+        "has_scoring": in_selected,
+        "label": "今日榜單股票" if in_selected else "未進今日榜單",
+    }
+
+
 @app.on_event("startup")
 def startup_event() -> None:
     if not scheduler.running:
         print("[APP] Starting scheduler")
         scheduler.add_job(
             _run_scan_job,
-            CronTrigger(day_of_week="mon-fri", hour=21, minute=0),
+            CronTrigger(day_of_week="mon-fri", hour=17, minute=0),
             id="daily_scan_tw",
             replace_existing=True,
         )
         scheduler.start()
-        print("[APP] Scheduler started: Mon-Fri 21:00 Asia/Taipei")
+        print("[APP] Scheduler started: Mon-Fri 17:00 Asia/Taipei")
 
 
 @app.on_event("shutdown")
@@ -693,7 +716,7 @@ def health() -> dict[str, Any]:
         "service": APP_NAME,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "scheduler_running": scheduler.running,
-        "schedule": "Mon-Fri 21:00 Asia/Taipei",
+        "schedule": "Mon-Fri 17:00 Asia/Taipei",
         "scan_running": scan_running,
         "last_scan_error": last_scan_error,
         "last_finished_at": last_finished_at,
@@ -715,8 +738,6 @@ def trigger_scan() -> dict[str, Any]:
             "message": "掃描已在執行中",
             "status": current,
         }
-
-    print("[API] Manual trigger received")
 
     thread = threading.Thread(target=_run_scan_job, daemon=True)
     thread.start()
@@ -755,16 +776,19 @@ def get_watchlist() -> list[dict[str, Any]]:
 @app.get("/api/stocks/{stock_id}")
 def get_stock_detail(stock_id: str) -> dict[str, Any]:
     snapshot = get_snapshot_or_404()
-    row = find_stock_row(snapshot, stock_id)
+    row, ctx = find_stock_context(snapshot, stock_id)
 
-    overview = build_overview_from_snapshot(row)
-    enrich_overview_with_price(stock_id, overview)
+    in_selected = bool(ctx["in_selected"])
+    overview = build_overview_from_row(row, in_selected=in_selected)
+
+    enrich_overview_with_price(overview, stock_id)
     enrich_overview_with_per(stock_id, overview)
 
     institutional_summary = enrich_overview_with_institutional(stock_id, overview)
     margin_summary = enrich_overview_with_margin(stock_id, overview)
 
     return {
+        "meta": build_stock_meta(stock_id, in_selected=in_selected, source=ctx["source"]),
         "overview": overview,
         "revenues": get_revenues_list(stock_id),
         "eps_list": get_eps_list(stock_id),
@@ -779,37 +803,31 @@ def get_stock_detail(stock_id: str) -> dict[str, Any]:
 
 @app.get("/api/stocks/{stock_id}/revenues")
 def get_stock_revenues(stock_id: str) -> list[dict[str, Any]]:
-    _ = get_snapshot_or_404()
     return get_revenues_list(stock_id)
 
 
 @app.get("/api/stocks/{stock_id}/eps")
 def get_stock_eps(stock_id: str) -> list[dict[str, Any]]:
-    _ = get_snapshot_or_404()
     return get_eps_list(stock_id)
 
 
 @app.get("/api/stocks/{stock_id}/dividends")
 def get_stock_dividends(stock_id: str) -> list[dict[str, Any]]:
-    _ = get_snapshot_or_404()
     return get_dividends_list(stock_id)
 
 
 @app.get("/api/stocks/{stock_id}/financials")
 def get_stock_financials(stock_id: str) -> list[dict[str, Any]]:
-    _ = get_snapshot_or_404()
     return get_financials_list(stock_id)
 
 
 @app.get("/api/stocks/{stock_id}/news")
 def get_stock_news(stock_id: str) -> list[dict[str, Any]]:
-    _ = get_snapshot_or_404()
     return get_news_list(stock_id)
 
 
 @app.get("/api/stocks/{stock_id}/broker-branches")
 def get_stock_broker_branches(stock_id: str) -> list[dict[str, Any]]:
-    _ = get_snapshot_or_404()
     return get_broker_branches_list(stock_id)
 
 
@@ -818,21 +836,61 @@ def search_stocks(
     q: str = Query(default="", description="股號、名稱、題材關鍵字"),
     tag: str = Query(default=""),
     theme: str = Query(default=""),
-):
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[dict[str, Any]]:
     snapshot = get_snapshot_or_404()
+    selected_rows = get_all_selected_rows(snapshot)
+    selected_ids = {str(r.get("stock_id")) for r in selected_rows}
 
-    rows = snapshot.get("data", {}).get("all_selected", [])
+    market_df = load_market_snapshot_df()
+    if market_df.empty:
+        base_rows = selected_rows
+    else:
+        base_rows = market_df.to_dict(orient="records")
+
     ql = q.lower().strip()
-    filtered = []
+    filtered: list[dict[str, Any]] = []
 
-    for row in rows:
-        hay = f"{row.get('stock_id','')} {row.get('name','')} {row.get('group','')} {row.get('theme','')}".lower()
+    for row in base_rows:
+        stock_id = str(row.get("stock_id", ""))
+        stock_name = str(row.get("name", "") or row.get("stock_name", ""))
+        group = str(row.get("group", ""))
+        row_theme = str(row.get("theme", ""))
+
+        hay = f"{stock_id} {stock_name} {group} {row_theme}".lower()
+
         if ql and ql not in hay:
             continue
-        if tag and row.get("radar_tag") != tag and row.get("tag") != tag:
-            continue
-        if theme and row.get("theme") != theme:
-            continue
-        filtered.append(row)
 
-    return filtered
+        if tag:
+            row_tag = str(row.get("radar_tag", "") or row.get("tag", ""))
+            if row_tag != tag:
+                continue
+
+        if theme and row_theme != theme:
+            continue
+
+        filtered.append(
+            {
+                "stock_id": stock_id,
+                "name": stock_name,
+                "close": safe_float(row.get("close")),
+                "group": group or None,
+                "theme": row_theme or None,
+                "turnover_100m": safe_float(row.get("turnover_100m")),
+                "in_selected": stock_id in selected_ids,
+                "radar_tag": row.get("radar_tag") if stock_id in selected_ids else None,
+                "score_total": safe_float(row.get("score_total")) if stock_id in selected_ids else None,
+            }
+        )
+
+    filtered = sorted(
+        filtered,
+        key=lambda x: (
+            0 if x["in_selected"] else 1,
+            -(x["score_total"] or 0),
+            -(x["turnover_100m"] or 0),
+        ),
+    )
+
+    return filtered[:limit]
