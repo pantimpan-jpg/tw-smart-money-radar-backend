@@ -160,6 +160,20 @@ def safe_str(value: Any) -> str | None:
     return text if text else None
 
 
+def to_lot_from_shares(value: Any) -> float | None:
+    num = safe_float(value)
+    if num is None:
+        return None
+    return num / 1000.0
+
+
+def signed_lot_int(value: Any) -> int | None:
+    num = to_lot_from_shares(value)
+    if num is None:
+        return None
+    return int(round(num))
+
+
 def latest_date_text(df: pd.DataFrame) -> str | None:
     if df.empty or "date" not in df.columns:
         return None
@@ -203,7 +217,7 @@ def build_overview_from_snapshot(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def get_recent_price_df(stock_id: str) -> pd.DataFrame:
-    start_date = (date.today() - timedelta(days=45)).isoformat()
+    start_date = (date.today() - timedelta(days=60)).isoformat()
     return finmind_get("TaiwanStockPrice", stock_id, start_date)
 
 
@@ -244,8 +258,9 @@ def enrich_overview_with_price(overview: dict[str, Any], stock_id: str) -> None:
             overview["turnover_100m"] = latest_money / 100000000
 
     if close_col and len(df) >= 20:
-        rolling_high = pd.to_numeric(df[close_col], errors="coerce").rolling(20).max().iloc[-1]
-        rolling_low = pd.to_numeric(df[close_col], errors="coerce").rolling(20).min().iloc[-1]
+        close_series = pd.to_numeric(df[close_col], errors="coerce")
+        rolling_high = close_series.rolling(20).max().iloc[-1]
+        rolling_low = close_series.rolling(20).min().iloc[-1]
         overview["pressure_price"] = safe_float(rolling_high)
         overview["support_price"] = safe_float(rolling_low)
 
@@ -266,75 +281,191 @@ def enrich_overview_with_per(stock_id: str, overview: dict[str, Any]) -> None:
     overview["dividend_yield"] = safe_float(latest.get("dividend_yield"))
 
 
-def enrich_overview_with_institutional(stock_id: str, overview: dict[str, Any]) -> None:
-    start_date = (date.today() - timedelta(days=10)).isoformat()
-    df = finmind_get("TaiwanStockInstitutionalInvestorsBuySell", stock_id, start_date)
-    if df.empty:
-        return
+def _normalize_institutional_name(name: str) -> str:
+    text = str(name)
+    if "外資" in text or "Foreign" in text:
+        return "foreign"
+    if "投信" in text or "Investment_Trust" in text:
+        return "trust"
+    if "自營商" in text or "Dealer" in text:
+        return "dealer"
+    return "other"
 
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.sort_values("date")
+
+def get_institutional_summary(stock_id: str) -> dict[str, Any]:
+    start_date = (date.today() - timedelta(days=40)).isoformat()
+    df = finmind_get("TaiwanStockInstitutionalInvestorsBuySell", stock_id, start_date)
+
+    empty_result = {
+        "latest_date": None,
+        "foreign": {"d1": None, "d5": None, "d10": None, "d20": None},
+        "trust": {"d1": None, "d5": None, "d10": None, "d20": None},
+        "dealer": {"d1": None, "d5": None, "d10": None, "d20": None},
+    }
+
+    if df.empty:
+        return empty_result
+
+    if "date" not in df.columns:
+        return empty_result
 
     name_col = None
     for candidate in ["name", "investors", "institutional_investors"]:
         if candidate in df.columns:
             name_col = candidate
             break
-    if not name_col:
-        return
+    if not name_col or "buy" not in df.columns or "sell" not in df.columns:
+        return empty_result
 
-    buy_col = "buy" if "buy" in df.columns else None
-    sell_col = "sell" if "sell" in df.columns else None
-    if not buy_col or not sell_col:
-        return
-
-    latest_date = df["date"].dropna().max()
-    if pd.isna(latest_date):
-        return
-
-    latest_df = df[df["date"] == latest_date].copy()
-    latest_df["buy"] = pd.to_numeric(latest_df[buy_col], errors="coerce").fillna(0)
-    latest_df["sell"] = pd.to_numeric(latest_df[sell_col], errors="coerce").fillna(0)
-    latest_df["net"] = latest_df["buy"] - latest_df["sell"]
-    latest_df["name_clean"] = latest_df[name_col].astype(str)
-
-    foreign = latest_df[latest_df["name_clean"].str.contains("外資|Foreign", case=False, na=False)]
-    trust = latest_df[latest_df["name_clean"].str.contains("投信|Investment_Trust", case=False, na=False)]
-    dealer = latest_df[latest_df["name_clean"].str.contains("自營商|Dealer", case=False, na=False)]
-
-    overview["foreign_buy_sell"] = float(foreign["net"].sum()) if not foreign.empty else 0.0
-    overview["investment_trust_buy_sell"] = float(trust["net"].sum()) if not trust.empty else 0.0
-    overview["dealer_buy_sell"] = float(dealer["net"].sum()) if not dealer.empty else 0.0
-
-
-def enrich_overview_with_margin(stock_id: str, overview: dict[str, Any]) -> None:
-    start_date = (date.today() - timedelta(days=10)).isoformat()
-    df = finmind_get("TaiwanStockMarginPurchaseShortSale", stock_id, start_date)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).copy()
     if df.empty:
-        return
+        return empty_result
 
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.sort_values("date")
+    df["kind"] = df[name_col].astype(str).map(_normalize_institutional_name)
+    df["buy_num"] = pd.to_numeric(df["buy"], errors="coerce").fillna(0)
+    df["sell_num"] = pd.to_numeric(df["sell"], errors="coerce").fillna(0)
+    df["net_lot"] = (df["buy_num"] - df["sell_num"]) / 1000.0
 
-    latest = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) >= 2 else None
+    grouped = (
+        df[df["kind"].isin(["foreign", "trust", "dealer"])]
+        .groupby(["date", "kind"], as_index=False)["net_lot"]
+        .sum()
+        .sort_values("date")
+    )
 
-    today_margin = safe_float(latest.get("MarginPurchaseTodayBalance"))
-    today_short = safe_float(latest.get("ShortSaleTodayBalance"))
+    latest_date = grouped["date"].max()
+    all_dates = sorted(grouped["date"].drop_duplicates().tolist())
 
-    prev_margin = safe_float(prev.get("MarginPurchaseTodayBalance")) if prev is not None else None
-    prev_short = safe_float(prev.get("ShortSaleTodayBalance")) if prev is not None else None
+    def calc_window(kind: str, window: int) -> int | None:
+        sub = grouped[grouped["kind"] == kind].copy()
+        if sub.empty:
+            return None
+        latest_sub = sub[sub["date"] <= latest_date].sort_values("date")
+        if latest_sub.empty:
+            return None
+        if window == 1:
+            value = latest_sub.iloc[-1]["net_lot"]
+            return int(round(value))
+        recent_dates = all_dates[-window:]
+        recent = latest_sub[latest_sub["date"].isin(recent_dates)]
+        if recent.empty:
+            return None
+        return int(round(recent["net_lot"].sum()))
 
-    overview["margin_balance"] = today_margin
-    overview["short_balance"] = today_short
+    return {
+        "latest_date": latest_date.date().isoformat() if pd.notna(latest_date) else None,
+        "foreign": {
+            "d1": calc_window("foreign", 1),
+            "d5": calc_window("foreign", 5),
+            "d10": calc_window("foreign", 10),
+            "d20": calc_window("foreign", 20),
+        },
+        "trust": {
+            "d1": calc_window("trust", 1),
+            "d5": calc_window("trust", 5),
+            "d10": calc_window("trust", 10),
+            "d20": calc_window("trust", 20),
+        },
+        "dealer": {
+            "d1": calc_window("dealer", 1),
+            "d5": calc_window("dealer", 5),
+            "d10": calc_window("dealer", 10),
+            "d20": calc_window("dealer", 20),
+        },
+    }
 
-    if today_margin is not None and prev_margin is not None:
-        overview["margin_change"] = today_margin - prev_margin
 
-    if today_short is not None and prev_short is not None:
-        overview["short_change"] = today_short - prev_short
+def enrich_overview_with_institutional(stock_id: str, overview: dict[str, Any]) -> dict[str, Any]:
+    summary = get_institutional_summary(stock_id)
+
+    overview["foreign_buy_sell"] = summary["foreign"]["d1"]
+    overview["investment_trust_buy_sell"] = summary["trust"]["d1"]
+    overview["dealer_buy_sell"] = summary["dealer"]["d1"]
+
+    return summary
+
+
+def get_margin_summary(stock_id: str) -> dict[str, Any]:
+    start_date = (date.today() - timedelta(days=40)).isoformat()
+    df = finmind_get("TaiwanStockMarginPurchaseShortSale", stock_id, start_date)
+
+    empty_result = {
+        "latest_date": None,
+        "margin_balance": None,
+        "short_balance": None,
+        "margin": {"d1": None, "d5": None, "d10": None, "d20": None},
+        "short": {"d1": None, "d5": None, "d10": None, "d20": None},
+    }
+
+    if df.empty or "date" not in df.columns:
+        return empty_result
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).copy()
+    if df.empty:
+        return empty_result
+
+    if "MarginPurchaseTodayBalance" not in df.columns or "ShortSaleTodayBalance" not in df.columns:
+        return empty_result
+
+    df["margin_balance"] = pd.to_numeric(df["MarginPurchaseTodayBalance"], errors="coerce")
+    df["short_balance"] = pd.to_numeric(df["ShortSaleTodayBalance"], errors="coerce")
+    df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+
+    latest_idx = df.index[-1]
+    latest_date = df.loc[latest_idx, "date"]
+
+    def calc_balance_change(col: str, days: int) -> int | None:
+        sub = df[["date", col]].dropna().copy()
+        if sub.empty:
+            return None
+        sub = sub.sort_values("date").reset_index(drop=True)
+        latest_value = sub.iloc[-1][col]
+
+        if days == 1:
+            if len(sub) < 2:
+                return None
+            prev_value = sub.iloc[-2][col]
+            return int(round((latest_value - prev_value) / 1000.0))
+
+        if len(sub) <= days:
+            return None
+
+        base_value = sub.iloc[-(days + 1)][col]
+        return int(round((latest_value - base_value) / 1000.0))
+
+    latest_margin_balance = df.iloc[-1]["margin_balance"]
+    latest_short_balance = df.iloc[-1]["short_balance"]
+
+    return {
+        "latest_date": latest_date.date().isoformat() if pd.notna(latest_date) else None,
+        "margin_balance": int(round(latest_margin_balance / 1000.0)) if pd.notna(latest_margin_balance) else None,
+        "short_balance": int(round(latest_short_balance / 1000.0)) if pd.notna(latest_short_balance) else None,
+        "margin": {
+            "d1": calc_balance_change("margin_balance", 1),
+            "d5": calc_balance_change("margin_balance", 5),
+            "d10": calc_balance_change("margin_balance", 10),
+            "d20": calc_balance_change("margin_balance", 20),
+        },
+        "short": {
+            "d1": calc_balance_change("short_balance", 1),
+            "d5": calc_balance_change("short_balance", 5),
+            "d10": calc_balance_change("short_balance", 10),
+            "d20": calc_balance_change("short_balance", 20),
+        },
+    }
+
+
+def enrich_overview_with_margin(stock_id: str, overview: dict[str, Any]) -> dict[str, Any]:
+    summary = get_margin_summary(stock_id)
+
+    overview["margin_balance"] = summary["margin_balance"]
+    overview["short_balance"] = summary["short_balance"]
+    overview["margin_change"] = summary["margin"]["d1"]
+    overview["short_change"] = summary["short"]["d1"]
+
+    return summary
 
 
 def get_revenues_list(stock_id: str) -> list[dict[str, Any]]:
@@ -490,13 +621,21 @@ def get_news_list(stock_id: str) -> list[dict[str, Any]]:
 
     out: list[dict[str, Any]] = []
     for _, row in df.head(20).iterrows():
+        published_at = None
+        row_date = row.get("date")
+        if pd.notna(row_date):
+            try:
+                published_at = pd.Timestamp(row_date).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                published_at = None
+
         out.append(
             {
                 "id": None,
                 "title": safe_str(row.get("title")) or "待補",
                 "summary": safe_str(row.get("description")),
                 "source": safe_str(row.get("source")),
-                "published_at": row["date"].strftime("%Y-%m-%d %H:%M:%S") if "date" in row and pd.notna(row["date"]) else None,
+                "published_at": published_at,
                 "url": safe_str(row.get("link")),
             }
         )
@@ -621,8 +760,9 @@ def get_stock_detail(stock_id: str) -> dict[str, Any]:
     overview = build_overview_from_snapshot(row)
     enrich_overview_with_price(stock_id, overview)
     enrich_overview_with_per(stock_id, overview)
-    enrich_overview_with_institutional(stock_id, overview)
-    enrich_overview_with_margin(stock_id, overview)
+
+    institutional_summary = enrich_overview_with_institutional(stock_id, overview)
+    margin_summary = enrich_overview_with_margin(stock_id, overview)
 
     return {
         "overview": overview,
@@ -632,6 +772,8 @@ def get_stock_detail(stock_id: str) -> dict[str, Any]:
         "financials": get_financials_list(stock_id),
         "news": get_news_list(stock_id),
         "broker_branches": get_broker_branches_list(stock_id),
+        "institutional_summary": institutional_summary,
+        "margin_summary": margin_summary,
     }
 
 
