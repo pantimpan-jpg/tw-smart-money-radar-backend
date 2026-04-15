@@ -27,7 +27,7 @@ def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
         (df["close"] >= MIN_PRICE)
         & (df["close"] <= MAX_PRICE)
         & (df["turnover_100m"] >= MIN_TURNOVER_100M)
-        & (df["volume_ratio"] >= MIN_VOLUME_RATIO)
+        & (df["volume_ratio"] >= max(MIN_VOLUME_RATIO, 1.08))
         & (df["volume_avg20"] >= MIN_AVG_VOLUME_LOT)
         & ((df["close"] > df["ma20"]) | (df["close"] > df["ma60"]))
         & (df["pct_from_ma20"] <= MAX_DISTANCE_FROM_MA20)
@@ -258,17 +258,26 @@ def calc_revenue_score(row: pd.Series) -> float:
 def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
+    out["pct_5d"] = 0.0
+    out["pct_20d"] = 0.0
+
     out["tech_score"] = 0.0
     out.loc[out["close"] > out["ma20"], "tech_score"] += 5
     out.loc[out["close"] > out["ma60"], "tech_score"] += 8
     out.loc[out["ma20"] > out["ma60"], "tech_score"] += 5
-    out.loc[(out["volume_ratio"] >= 1.5) & (out["volume_ratio"] < 2), "tech_score"] += 6
-    out.loc[out["volume_ratio"] >= 2, "tech_score"] += 10
+
+    out.loc[(out["volume_ratio"] >= 1.1) & (out["volume_ratio"] < 1.3), "tech_score"] += 4
+    out.loc[(out["volume_ratio"] >= 1.3) & (out["volume_ratio"] < 1.8), "tech_score"] += 7
+    out.loc[out["volume_ratio"] >= 1.8, "tech_score"] += 9
+
     out.loc[(out["turnover_100m"] >= 5) & (out["turnover_100m"] < 10), "tech_score"] += 5
     out.loc[out["turnover_100m"] >= 10, "tech_score"] += 8
-    out.loc[(out["rsi"] >= 50) & (out["rsi"] <= 70), "tech_score"] += 6
-    out.loc[out["rsi"] > 70, "tech_score"] -= 3
+
+    out.loc[(out["rsi"] >= 50) & (out["rsi"] <= 72), "tech_score"] += 6
+    out.loc[(out["rsi"] > 72) & (out["rsi"] <= 78), "tech_score"] += 3
+    out.loc[out["rsi"] > 78, "tech_score"] -= 2
     out.loc[out["rsi"] < 35, "tech_score"] -= 2
+
     out.loc[out["macd"] > out["macd_signal"], "tech_score"] += 6
     out.loc[out["macd_hist"] > 0, "tech_score"] += 4
     out.loc[out["close"] > out["boll_mid"], "tech_score"] += 4
@@ -277,17 +286,29 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
 
     out["score_starting"] = 0.0
     out.loc[(out["close"] > out["ma20"]) & (out["close"] <= out["ma20"] * 1.08), "score_starting"] += 8
-    out.loc[out["volume_ratio"] >= 1.5, "score_starting"] += 5
+    out.loc[(out["volume_ratio"] >= 1.1) & (out["volume_ratio"] < 1.3), "score_starting"] += 6
+    out.loc[(out["volume_ratio"] >= 1.3) & (out["volume_ratio"] < 1.8), "score_starting"] += 3
     out.loc[out["macd"] > out["macd_signal"], "score_starting"] += 4
-    out.loc[out["rsi"] < 68, "score_starting"] += 3
+    out.loc[(out["rsi"] >= 50) & (out["rsi"] <= 68), "score_starting"] += 5
+    out.loc[(out["rsi"] > 68) & (out["rsi"] <= 74), "score_starting"] += 2
     out.loc[out["institution_force"] >= 0.05, "score_starting"] += 4
+    out.loc[out["turnover_100m"] >= 5, "score_starting"] += 3
+    out.loc[out["close"] > out["platform_high_20d"], "score_starting"] += 4
+    out.loc[out["pct_from_ma20"] > 8, "score_starting"] -= 6
+    out.loc[out["rsi"] > 78, "score_starting"] -= 6
 
     out["score_second_wave"] = 0.0
-    out.loc[out["close"] > out["ma20"] * 1.08, "score_second_wave"] += 8
+    out.loc[out["close"] > out["ma20"] * 1.03, "score_second_wave"] += 5
     out.loc[out["close"] > out["ma60"], "score_second_wave"] += 4
     out.loc[out["obv_trend"] > 0, "score_second_wave"] += 5
     out.loc[out["macd_hist"] > 0, "score_second_wave"] += 5
+    out.loc[(out["rsi"] >= 60) & (out["rsi"] <= 78), "score_second_wave"] += 5
+    out.loc[(out["rsi"] > 78) & (out["rsi"] <= 84), "score_second_wave"] += 2
     out.loc[out["investment_buy_days"] >= 3, "score_second_wave"] += 4
+    out.loc[out["foreign_buy_days"] >= 3, "score_second_wave"] += 3
+    out.loc[out["main_force_score"] >= 6, "score_second_wave"] += 4
+    out.loc[out["broker_score"] >= 5, "score_second_wave"] += 3
+    out.loc[out["pct_from_ma20"] > 15, "score_second_wave"] -= 5
 
     out["theme"] = out.apply(lambda x: classify_theme(str(x["name"]), str(x["group"])), axis=1)
     out["institution_score"] = out.apply(calc_institution_score, axis=1)
@@ -305,8 +326,23 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
         + out["revenue_score"]
     )
 
+    starting_bias = (
+        out["score_starting"]
+        + np.where(out["pct_from_ma20"] <= 8, 3, 0)
+        + np.where(out["volume_ratio"] <= 1.35, 2, 0)
+        - np.where(out["rsi"] >= 75, 4, 0)
+    )
+
+    second_wave_bias = (
+        out["score_second_wave"]
+        + np.where(out["close"] > out["ma60"], 2, 0)
+        + np.where(out["investment_buy_days"] >= 3, 2, 0)
+        + np.where(out["broker_score"] >= 5, 2, 0)
+        + np.where(out["rsi"] >= 70, 1, 0)
+    )
+
     out["radar_tag"] = np.where(
-        out["score_starting"] >= out["score_second_wave"],
+        starting_bias >= second_wave_bias,
         "剛啟動",
         "可能第二波",
     )
@@ -317,7 +353,7 @@ def build_reason_and_targets(row: pd.Series) -> dict:
     reasons: list[str] = []
 
     if row.get("radar_tag") == "剛啟動":
-        reasons.append("型態偏剛啟動，仍在起漲初段")
+        reasons.append("型態偏剛啟動，偏向較早期轉強")
     else:
         reasons.append("型態偏第二波，屬強勢整理後再攻候選")
 
@@ -348,8 +384,10 @@ def build_reason_and_targets(row: pd.Series) -> dict:
 
     if row.get("volume_ratio", 0) >= 2:
         reasons.append("量比放大，資金關注提高")
-    elif row.get("volume_ratio", 0) >= 1.5:
+    elif row.get("volume_ratio", 0) >= 1.3:
         reasons.append("量能優於均值")
+    elif row.get("volume_ratio", 0) >= 1.1:
+        reasons.append("量能剛開始轉強")
 
     if row.get("close", 0) > row.get("ma20", 0) > 0:
         reasons.append("站上 MA20")
@@ -416,12 +454,12 @@ def build_payload(raw_df: pd.DataFrame, analyzed_df: pd.DataFrame) -> dict:
     watchlist_df = analyzed_df.iloc[TOP30_COUNT:TOP30_COUNT + WATCHLIST_COUNT].copy()
 
     starting_df = analyzed_df[analyzed_df["radar_tag"] == "剛啟動"].sort_values(
-        ["score_starting", "score_total"],
+        ["score_starting", "score_total", "turnover_100m"],
         ascending=False,
     ).head(TOP30_COUNT).copy()
 
     second_wave_df = analyzed_df[analyzed_df["radar_tag"] == "可能第二波"].sort_values(
-        ["score_second_wave", "score_total"],
+        ["score_second_wave", "score_total", "turnover_100m"],
         ascending=False,
     ).head(TOP30_COUNT).copy()
 
@@ -431,7 +469,7 @@ def build_payload(raw_df: pd.DataFrame, analyzed_df: pd.DataFrame) -> dict:
     ).head(BROKER_TRACK_COUNT).copy()
 
     risk_overheated_df = analyzed_df[
-        (analyzed_df["volume_ratio"] >= 2.5) & (analyzed_df["rsi"] >= 70)
+        (analyzed_df["volume_ratio"] >= 2.5) & (analyzed_df["rsi"] >= 80)
     ].head(20).copy()
 
     high_turnover_df = analyzed_df.sort_values(
