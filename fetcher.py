@@ -34,7 +34,7 @@ EXCLUDED_GROUP_KEYWORDS = [
     "金控",
 ]
 
-EXCLUDED_STOCK_ID_PREFIXES = []
+EXCLUDED_STOCK_ID_PREFIXES: list[str] = []
 
 
 def _to_float(value: Any) -> float:
@@ -193,8 +193,6 @@ def _build_stock_snapshot(stock_id: str, name: str, group: str, price_df: pd.Dat
 
     latest_close = _to_float(close.iloc[-1])
     latest_open = _to_float(open_.iloc[-1])
-    latest_high = _to_float(high.iloc[-1])
-    latest_low = _to_float(low.iloc[-1])
     latest_volume = _to_float(volume.iloc[-1])
     latest_money = _to_float(trading_money.iloc[-1])
 
@@ -270,6 +268,7 @@ def _normalize_stock_info_df(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
     rename_map = {}
+
     if "stock_id" not in out.columns:
         for c in ["stock_id", "stockId", "data_id"]:
             if c in out.columns:
@@ -278,8 +277,10 @@ def _normalize_stock_info_df(df: pd.DataFrame) -> pd.DataFrame:
 
     if "stock_name" in out.columns and "name" not in out.columns:
         rename_map["stock_name"] = "name"
+
     if "industry_category" in out.columns and "group" not in out.columns:
         rename_map["industry_category"] = "group"
+
     if "industry" in out.columns and "group" not in out.columns:
         rename_map["industry"] = "group"
 
@@ -301,16 +302,17 @@ def _normalize_stock_info_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def fetch_stock_universe() -> pd.DataFrame:
-    info_df = finmind_get("TaiwanStockInfo")
+    # 你的 finmind_get 需要 dataset, data_id, start_date 三個參數
+    # TaiwanStockInfo 雖然實際上不太用 data_id / start_date，但為了符合函式簽名必須傳
+    info_df = finmind_get("TaiwanStockInfo", "2330", "2024-01-01")
     if info_df.empty:
         raise RuntimeError("抓不到 TaiwanStockInfo")
 
     info_df = _normalize_stock_info_df(info_df)
 
-    # 只留 4 碼股票代碼，先排掉奇怪資料
     info_df = info_df[info_df["stock_id"].str.match(r"^\d{4}$", na=False)].copy()
 
-    # 最前面先排除 ETF / 金融，直接加速整體掃描
+    # 最前面先排除 ETF / 金融
     info_df["is_excluded"] = info_df.apply(
         lambda x: _is_excluded_stock(
             stock_id=str(x["stock_id"]),
@@ -403,7 +405,7 @@ def fetch_market_snapshot_parallel(progress_callback=None) -> pd.DataFrame:
 
     df = pd.DataFrame(results)
 
-    # 這裡保留 fetch 成功的資料；fetch_error / bars不足 先不進主流程
+    # 只保留真正抓成功的
     df = df[df["fetch_skipped_reason"].isna()].copy()
 
     if df.empty:
