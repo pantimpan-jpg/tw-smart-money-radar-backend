@@ -89,7 +89,6 @@ def _run_scan_job() -> None:
     )
 
     try:
-        print("[SCAN] === Starting scan job ===")
         result = run_scan(save=True, progress_callback=progress_callback)
         last_finished_at = datetime.now(timezone.utc).isoformat()
 
@@ -102,7 +101,6 @@ def _run_scan_job() -> None:
             last_scan_error=None,
         )
 
-        print("[SCAN] === Scan completed successfully ===")
         if isinstance(result, dict):
             print(f"[SCAN] Result keys: {list(result.keys())}")
 
@@ -114,13 +112,10 @@ def _run_scan_job() -> None:
             message=f"掃描失敗：{e}",
             last_scan_error=str(e),
         )
-        print("[SCAN] === Scan failed ===")
-        print(f"[SCAN] Error: {e}")
         print(traceback.format_exc())
 
     finally:
         scan_running = False
-        print("[SCAN] === Scan thread finished ===")
 
 
 def get_snapshot_or_404() -> dict[str, Any]:
@@ -162,27 +157,18 @@ def safe_float(value: Any) -> float | None:
         return None
 
 
+def safe_int(value: Any) -> int | None:
+    num = safe_float(value)
+    if num is None:
+        return None
+    return int(round(num))
+
+
 def safe_str(value: Any) -> str | None:
     if value is None:
         return None
     text = str(value).strip()
     return text if text else None
-
-
-def to_lot_from_shares(value: Any) -> float | None:
-    num = safe_float(value)
-    if num is None:
-        return None
-    return num / 1000.0
-
-
-def latest_date_text(df: pd.DataFrame) -> str | None:
-    if df.empty or "date" not in df.columns:
-        return None
-    d = pd.to_datetime(df["date"], errors="coerce").dropna()
-    if d.empty:
-        return None
-    return d.max().date().isoformat()
 
 
 def find_stock_context(snapshot: dict[str, Any], stock_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -209,7 +195,19 @@ def find_stock_context(snapshot: dict[str, Any], stock_id: str) -> tuple[dict[st
     raise HTTPException(status_code=404, detail="找不到該股票")
 
 
+def build_stock_meta(stock_id: str, *, in_selected: bool, source: str) -> dict[str, Any]:
+    return {
+        "stock_id": stock_id,
+        "in_selected": in_selected,
+        "source": source,
+        "has_scoring": in_selected,
+        "label": "今日榜單股票" if in_selected else "未進今日榜單",
+    }
+
+
 def build_overview_from_row(row: dict[str, Any], *, in_selected: bool) -> dict[str, Any]:
+    trade_warning = safe_str(row.get("trade_warning")) or safe_str(row.get("restriction_note"))
+
     return {
         "stock_id": str(row.get("stock_id", "")),
         "stock_name": row.get("name") or row.get("stock_name") or str(row.get("stock_id", "")),
@@ -237,20 +235,24 @@ def build_overview_from_row(row: dict[str, Any], *, in_selected: bool) -> dict[s
         "final_score": safe_float(row.get("score_total") or row.get("score")) if in_selected else None,
         "technical_tag": row.get("tag") if in_selected else None,
         "radar_tag": row.get("radar_tag") if in_selected else None,
-        "support_price": None,
-        "pressure_price": None,
+        "near_support": safe_float(row.get("near_support")),
+        "strong_support": safe_float(row.get("strong_support")),
+        "near_pressure": safe_float(row.get("near_resistance") or row.get("near_pressure")),
+        "strong_pressure": safe_float(row.get("strong_resistance") or row.get("strong_pressure")),
+        "trade_warning": trade_warning,
+        "is_restricted": bool(row.get("is_restricted", False)),
     }
 
 
 def get_recent_price_df(stock_id: str) -> pd.DataFrame:
-    start_date = (date.today() - timedelta(days=120)).isoformat()
+    start_date = (date.today() - timedelta(days=220)).isoformat()
     return finmind_get("TaiwanStockPrice", stock_id, start_date)
 
 
-def enrich_overview_with_price(overview: dict[str, Any], stock_id: str) -> None:
+def enrich_overview_with_price(overview: dict[str, Any], stock_id: str) -> pd.DataFrame:
     df = get_recent_price_df(stock_id)
     if df.empty:
-        return
+        return df
 
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
@@ -258,39 +260,49 @@ def enrich_overview_with_price(overview: dict[str, Any], stock_id: str) -> None:
 
     latest = df.iloc[-1]
 
-    close_col = "close" if "close" in df.columns else None
-    open_col = "open" if "open" in df.columns else None
-    volume_col = "Trading_Volume" if "Trading_Volume" in df.columns else None
-    money_col = "Trading_money" if "Trading_money" in df.columns else None
-
-    latest_close = safe_float(latest.get(close_col)) if close_col else None
-    latest_open = safe_float(latest.get(open_col)) if open_col else None
+    latest_close = safe_float(latest.get("close"))
+    latest_open = safe_float(latest.get("open"))
 
     if latest_close is not None:
         overview["close"] = latest_close
 
-    if latest_close is not None and latest_open is not None:
+    if latest_close is not None and latest_open is not None and latest_open != 0:
         overview["change"] = latest_close - latest_open
-        if latest_open != 0:
-            overview["change_pct"] = (latest_close - latest_open) / latest_open * 100
+        overview["change_pct"] = (latest_close - latest_open) / latest_open * 100
 
-    if volume_col:
-        latest_volume = safe_float(latest.get(volume_col))
+    latest_volume = safe_float(latest.get("Trading_Volume"))
+    if latest_volume is not None:
         overview["volume"] = latest_volume
 
-    if money_col:
-        latest_money = safe_float(latest.get(money_col))
-        if latest_money is not None:
-            overview["turnover_100m"] = latest_money / 100000000
+    latest_money = safe_float(latest.get("Trading_money"))
+    if latest_money is not None:
+        overview["turnover_100m"] = latest_money / 100000000
 
-    if close_col and len(df) >= 20:
-        close_series = pd.to_numeric(df[close_col], errors="coerce")
-        overview["pressure_price"] = safe_float(close_series.rolling(20).max().iloc[-1])
-        overview["support_price"] = safe_float(close_series.rolling(20).min().iloc[-1])
+    if len(df) >= 20:
+        close_series = pd.to_numeric(df["close"], errors="coerce")
+        low_series = pd.to_numeric(df.get("min", df.get("low", df["close"])), errors="coerce")
+        high_series = pd.to_numeric(df.get("max", df.get("high", df["close"])), errors="coerce")
+
+        ma20 = close_series.rolling(20).mean().iloc[-1]
+        ma60 = close_series.rolling(60).mean().iloc[-1] if len(df) >= 60 else np.nan
+        low_5 = low_series.tail(5).min()
+        low_20 = low_series.tail(20).min()
+        high_5 = high_series.tail(5).max()
+        high_20 = high_series.tail(20).max()
+
+        near_support = max(low_5, ma20) if pd.notna(ma20) else low_5
+        strong_support = min(low_20, ma60) if pd.notna(ma60) else low_20
+
+        overview["near_support"] = round(float(near_support), 2) if pd.notna(near_support) else overview.get("near_support")
+        overview["strong_support"] = round(float(strong_support), 2) if pd.notna(strong_support) else overview.get("strong_support")
+        overview["near_pressure"] = round(float(high_5), 2) if pd.notna(high_5) else overview.get("near_pressure")
+        overview["strong_pressure"] = round(float(max(high_20, high_5 * 1.03)), 2) if pd.notna(high_20) and pd.notna(high_5) else overview.get("strong_pressure")
+
+    return df
 
 
 def enrich_overview_with_per(stock_id: str, overview: dict[str, Any]) -> None:
-    start_date = (date.today() - timedelta(days=30)).isoformat()
+    start_date = (date.today() - timedelta(days=60)).isoformat()
     df = finmind_get("TaiwanStockPER", stock_id, start_date)
     if df.empty:
         return
@@ -317,7 +329,7 @@ def _normalize_institutional_name(name: str) -> str:
 
 
 def get_institutional_summary(stock_id: str) -> dict[str, Any]:
-    start_date = (date.today() - timedelta(days=40)).isoformat()
+    start_date = (date.today() - timedelta(days=50)).isoformat()
     df = finmind_get("TaiwanStockInstitutionalInvestorsBuySell", stock_id, start_date)
 
     empty_result = {
@@ -405,7 +417,7 @@ def enrich_overview_with_institutional(stock_id: str, overview: dict[str, Any]) 
 
 
 def get_margin_summary(stock_id: str) -> dict[str, Any]:
-    start_date = (date.today() - timedelta(days=40)).isoformat()
+    start_date = (date.today() - timedelta(days=50)).isoformat()
     df = finmind_get("TaiwanStockMarginPurchaseShortSale", stock_id, start_date)
 
     empty_result = {
@@ -419,7 +431,9 @@ def get_margin_summary(stock_id: str) -> dict[str, Any]:
     if df.empty or "date" not in df.columns:
         return empty_result
 
-    if "MarginPurchaseTodayBalance" not in df.columns or "ShortSaleTodayBalance" not in df.columns:
+    margin_col = "MarginPurchaseTodayBalance" if "MarginPurchaseTodayBalance" in df.columns else None
+    short_col = "ShortSaleTodayBalance" if "ShortSaleTodayBalance" in df.columns else None
+    if margin_col is None or short_col is None:
         return empty_result
 
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
@@ -427,11 +441,9 @@ def get_margin_summary(stock_id: str) -> dict[str, Any]:
     if df.empty:
         return empty_result
 
-    df["margin_balance"] = pd.to_numeric(df["MarginPurchaseTodayBalance"], errors="coerce")
-    df["short_balance"] = pd.to_numeric(df["ShortSaleTodayBalance"], errors="coerce")
+    df["margin_balance"] = pd.to_numeric(df[margin_col], errors="coerce")
+    df["short_balance"] = pd.to_numeric(df[short_col], errors="coerce")
     df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
-
-    latest_date = df.iloc[-1]["date"]
 
     def calc_change(col: str, days: int) -> int | None:
         sub = df[["date", col]].dropna().copy().sort_values("date").reset_index(drop=True)
@@ -450,6 +462,8 @@ def get_margin_summary(stock_id: str) -> dict[str, Any]:
 
         base_value = sub.iloc[-(days + 1)][col]
         return int(round((latest_value - base_value) / 1000.0))
+
+    latest_date = df.iloc[-1]["date"]
 
     latest_margin_balance = df.iloc[-1]["margin_balance"]
     latest_short_balance = df.iloc[-1]["short_balance"]
@@ -483,12 +497,9 @@ def enrich_overview_with_margin(stock_id: str, overview: dict[str, Any]) -> dict
 
 
 def get_revenues_list(stock_id: str) -> list[dict[str, Any]]:
-    start_date = (date.today() - timedelta(days=500)).isoformat()
+    start_date = (date.today() - timedelta(days=550)).isoformat()
     df = finmind_get("TaiwanStockMonthRevenue", stock_id, start_date)
-    if df.empty:
-        return []
-
-    if "date" not in df.columns:
+    if df.empty or "date" not in df.columns:
         return []
 
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
@@ -516,21 +527,20 @@ def get_revenues_list(stock_id: str) -> list[dict[str, Any]]:
 
 
 def get_eps_list(stock_id: str) -> list[dict[str, Any]]:
-    start_date = (date.today() - timedelta(days=1200)).isoformat()
+    start_date = (date.today() - timedelta(days=1600)).isoformat()
     df = finmind_get("TaiwanStockFinancialStatements", stock_id, start_date)
-    if df.empty:
+    if df.empty or "type" not in df.columns or "value" not in df.columns or "date" not in df.columns:
         return []
 
-    if "type" not in df.columns or "value" not in df.columns or "date" not in df.columns:
-        return []
-
-    eps_df = df[df["type"].astype(str).str.contains("基本每股盈餘", na=False)].copy()
+    eps_df = df[
+        df["type"].astype(str).str.contains("基本每股盈餘|每股盈餘|EPS", regex=True, na=False)
+    ].copy()
     if eps_df.empty:
         return []
 
     eps_df["date"] = pd.to_datetime(eps_df["date"], errors="coerce")
     eps_df["value_num"] = pd.to_numeric(eps_df["value"], errors="coerce")
-    eps_df = eps_df.dropna(subset=["date"]).sort_values("date")
+    eps_df = eps_df.dropna(subset=["date", "value_num"]).sort_values("date")
 
     eps_df["yoy"] = eps_df["value_num"].pct_change(4) * 100
     eps_df["qoq"] = eps_df["value_num"].pct_change(1) * 100
@@ -550,7 +560,7 @@ def get_eps_list(stock_id: str) -> list[dict[str, Any]]:
 
 
 def get_dividends_list(stock_id: str) -> list[dict[str, Any]]:
-    start_date = (date.today() - timedelta(days=2500)).isoformat()
+    start_date = (date.today() - timedelta(days=2600)).isoformat()
     df = finmind_get("TaiwanStockDividend", stock_id, start_date)
     if df.empty:
         return []
@@ -580,12 +590,9 @@ def get_dividends_list(stock_id: str) -> list[dict[str, Any]]:
 
 
 def get_financials_list(stock_id: str) -> list[dict[str, Any]]:
-    start_date = (date.today() - timedelta(days=1200)).isoformat()
+    start_date = (date.today() - timedelta(days=1600)).isoformat()
     df = finmind_get("TaiwanStockFinancialStatements", stock_id, start_date)
-    if df.empty:
-        return []
-
-    if "date" not in df.columns or "type" not in df.columns or "value" not in df.columns:
+    if df.empty or "date" not in df.columns or "type" not in df.columns or "value" not in df.columns:
         return []
 
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
@@ -637,10 +644,7 @@ def get_news_list(stock_id: str) -> list[dict[str, Any]]:
         published_at = None
         row_date = row.get("date")
         if pd.notna(row_date):
-            try:
-                published_at = pd.Timestamp(row_date).strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                published_at = None
+            published_at = pd.Timestamp(row_date).strftime("%Y-%m-%d %H:%M:%S")
 
         out.append(
             {
@@ -678,20 +682,9 @@ def get_broker_branches_list(stock_id: str) -> list[dict[str, Any]]:
     return out
 
 
-def build_stock_meta(stock_id: str, *, in_selected: bool, source: str) -> dict[str, Any]:
-    return {
-        "stock_id": stock_id,
-        "in_selected": in_selected,
-        "source": source,
-        "has_scoring": in_selected,
-        "label": "今日榜單股票" if in_selected else "未進今日榜單",
-    }
-
-
 @app.on_event("startup")
 def startup_event() -> None:
     if not scheduler.running:
-        print("[APP] Starting scheduler")
         scheduler.add_job(
             _run_scan_job,
             CronTrigger(day_of_week="mon-fri", hour=17, minute=0),
@@ -699,13 +692,11 @@ def startup_event() -> None:
             replace_existing=True,
         )
         scheduler.start()
-        print("[APP] Scheduler started: Mon-Fri 17:00 Asia/Taipei")
 
 
 @app.on_event("shutdown")
 def shutdown_event() -> None:
     if scheduler.running:
-        print("[APP] Shutting down scheduler")
         scheduler.shutdown()
 
 
@@ -757,7 +748,6 @@ def get_scan_status() -> dict[str, Any]:
     status["scan_running"] = scan_running
     status["last_scan_error"] = last_scan_error
     status["last_updated"] = updated_at or last_finished_at or status.get("last_updated")
-
     return status
 
 
@@ -783,7 +773,6 @@ def get_stock_detail(stock_id: str) -> dict[str, Any]:
 
     enrich_overview_with_price(overview, stock_id)
     enrich_overview_with_per(stock_id, overview)
-
     institutional_summary = enrich_overview_with_institutional(stock_id, overview)
     margin_summary = enrich_overview_with_margin(stock_id, overview)
 
@@ -799,36 +788,6 @@ def get_stock_detail(stock_id: str) -> dict[str, Any]:
         "institutional_summary": institutional_summary,
         "margin_summary": margin_summary,
     }
-
-
-@app.get("/api/stocks/{stock_id}/revenues")
-def get_stock_revenues(stock_id: str) -> list[dict[str, Any]]:
-    return get_revenues_list(stock_id)
-
-
-@app.get("/api/stocks/{stock_id}/eps")
-def get_stock_eps(stock_id: str) -> list[dict[str, Any]]:
-    return get_eps_list(stock_id)
-
-
-@app.get("/api/stocks/{stock_id}/dividends")
-def get_stock_dividends(stock_id: str) -> list[dict[str, Any]]:
-    return get_dividends_list(stock_id)
-
-
-@app.get("/api/stocks/{stock_id}/financials")
-def get_stock_financials(stock_id: str) -> list[dict[str, Any]]:
-    return get_financials_list(stock_id)
-
-
-@app.get("/api/stocks/{stock_id}/news")
-def get_stock_news(stock_id: str) -> list[dict[str, Any]]:
-    return get_news_list(stock_id)
-
-
-@app.get("/api/stocks/{stock_id}/broker-branches")
-def get_stock_broker_branches(stock_id: str) -> list[dict[str, Any]]:
-    return get_broker_branches_list(stock_id)
 
 
 @app.get("/api/stocks")
@@ -856,6 +815,7 @@ def search_stocks(
         stock_name = str(row.get("name", "") or row.get("stock_name", ""))
         group = str(row.get("group", ""))
         row_theme = str(row.get("theme", ""))
+        trade_warning = str(row.get("trade_warning", "") or "")
 
         hay = f"{stock_id} {stock_name} {group} {row_theme}".lower()
 
@@ -881,6 +841,7 @@ def search_stocks(
                 "in_selected": stock_id in selected_ids,
                 "radar_tag": row.get("radar_tag") if stock_id in selected_ids else None,
                 "score_total": safe_float(row.get("score_total")) if stock_id in selected_ids else None,
+                "trade_warning": trade_warning or None,
             }
         )
 
