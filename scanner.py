@@ -44,40 +44,73 @@ EXCLUDED_GROUP_KEYWORDS = [
 ]
 
 THEME_RULES: dict[str, list[str]] = {
-    "記憶體": [
-        "記憶體", "DRAM", "NAND", "NOR", "快閃記憶體", "SSD"
-    ],
-    "ABF載板": [
-        "ABF", "載板", "IC載板"
-    ],
-    "散熱": [
-        "散熱", "熱導管", "均熱片", "散熱模組", "風扇"
-    ],
-    "PCB": [
-        "PCB", "印刷電路板", "銅箔基板", "CCL", "HDI", "軟板"
-    ],
-    "AI伺服器": [
-        "AI", "伺服器", "SERVER", "GPU", "ASIC", "資料中心"
-    ],
-    "CPO/矽光子": [
-        "CPO", "矽光子", "光通訊", "光模組", "高速光"
-    ],
-    "網通": [
-        "網通", "網路", "交換器", "路由器", "WIFI", "乙太網路"
-    ],
-    "低軌衛星": [
-        "低軌", "衛星", "通訊天線", "太空", "衛星通訊"
-    ],
-    "被動元件": [
-        "被動元件", "MLCC", "電感", "電容", "電阻"
-    ],
-    "電源/BBU": [
-        "電源", "BBU", "UPS", "電池備援", "電源供應器"
-    ],
-    "面板": [
-        "面板", "顯示器", "LCD", "OLED", "觸控"
-    ],
+    "記憶體": ["記憶體", "DRAM", "NAND", "NOR", "快閃記憶體", "SSD"],
+    "ABF載板": ["ABF", "載板", "IC載板"],
+    "散熱": ["散熱", "熱導管", "均熱片", "散熱模組", "風扇"],
+    "PCB": ["PCB", "印刷電路板", "銅箔基板", "CCL", "HDI", "軟板"],
+    "AI伺服器": ["AI", "伺服器", "SERVER", "GPU", "ASIC", "資料中心"],
+    "CPO/矽光子": ["CPO", "矽光子", "光通訊", "光模組", "高速光"],
+    "網通": ["網通", "網路", "交換器", "路由器", "WIFI", "乙太網路"],
+    "低軌衛星": ["低軌", "衛星", "通訊天線", "太空", "衛星通訊"],
+    "被動元件": ["被動元件", "MLCC", "電感", "電容", "電阻"],
+    "電源/BBU": ["電源", "BBU", "UPS", "電池備援", "電源供應器"],
+    "面板": ["面板", "顯示器", "LCD", "OLED", "觸控"],
 }
+
+NUMERIC_DEFAULTS: dict[str, float] = {
+    "close": 0.0,
+    "turnover_100m": 0.0,
+    "volume_ratio": 0.0,
+    "volume_avg20": 0.0,
+    "volume": 0.0,
+    "ma20": 0.0,
+    "ma60": 0.0,
+    "pct_from_ma20": 999.0,
+    "platform_high_20d": 0.0,
+    "platform_high_60d": 0.0,
+    "rsi": 0.0,
+    "macd": 0.0,
+    "macd_signal": 0.0,
+    "macd_hist": 0.0,
+    "boll_mid": 0.0,
+    "boll_upper": 0.0,
+    "obv_trend": 0.0,
+    "low_5d": 0.0,
+    "low_20d": 0.0,
+    "high_5d": 0.0,
+    "high_20d": 0.0,
+}
+
+
+def log_count(label: str, df: pd.DataFrame) -> None:
+    print(f"[SCAN] {label}: {len(df)}")
+
+
+def ensure_market_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    if "stock_id" not in out.columns:
+        out["stock_id"] = ""
+
+    if "name" not in out.columns:
+        out["name"] = ""
+
+    if "group" not in out.columns:
+        out["group"] = ""
+
+    for col, default in NUMERIC_DEFAULTS.items():
+        if col not in out.columns:
+            out[col] = default
+        out[col] = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+    out["stock_id"] = out["stock_id"].astype(str)
+    out["name"] = out["name"].astype(str)
+    out["group"] = out["group"].astype(str)
+
+    for col, default in NUMERIC_DEFAULTS.items():
+        out[col] = out[col].fillna(default)
+
+    return out
 
 
 def is_excluded_stock(name: str, group: str) -> bool:
@@ -104,33 +137,168 @@ def classify_theme(name: str, group: str) -> str:
     return "其他"
 
 
-def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
+def add_exclusion_flag(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-
-    if "name" not in out.columns:
-        out["name"] = ""
-    if "group" not in out.columns:
-        out["group"] = ""
-
     out["is_excluded"] = out.apply(
         lambda x: is_excluded_stock(str(x["name"]), str(x["group"])),
         axis=1,
     )
+    return out
 
-    cond = (
-        (~out["is_excluded"])
-        & (out["close"] >= MIN_PRICE)
-        & (out["close"] <= MAX_PRICE)
-        & (out["turnover_100m"] >= MIN_TURNOVER_100M)
-        & (out["volume_ratio"] >= max(MIN_VOLUME_RATIO, 1.08))
-        & (out["volume_avg20"] >= MIN_AVG_VOLUME_LOT)
-        & ((out["close"] > out["ma20"]) | (out["close"] > out["ma60"]))
-        & (out["pct_from_ma20"] <= MAX_DISTANCE_FROM_MA20)
+
+def sort_stage1_candidates(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    if out.empty:
+        return out
+
+    out["sort_turnover"] = pd.to_numeric(out["turnover_100m"], errors="coerce").fillna(0)
+    out["sort_volume_ratio"] = pd.to_numeric(out["volume_ratio"], errors="coerce").fillna(0)
+    out["sort_rsi_bonus"] = np.where((out["rsi"] >= 45) & (out["rsi"] <= 78), 1, 0)
+    out["sort_trend_bonus"] = np.where(
+        (out["close"] > out["ma20"]) | (out["close"] > out["ma60"]) | (out["macd"] > out["macd_signal"]),
+        1,
+        0,
     )
 
-    filtered = out.loc[cond].copy()
-    filtered = filtered.sort_values(["turnover_100m", "volume_ratio"], ascending=False)
-    return filtered.head(SECOND_SCAN_LIMIT).copy()
+    out = out.sort_values(
+        ["sort_turnover", "sort_volume_ratio", "sort_rsi_bonus", "sort_trend_bonus"],
+        ascending=False,
+    ).head(SECOND_SCAN_LIMIT).copy()
+
+    return out.drop(columns=["sort_turnover", "sort_volume_ratio", "sort_rsi_bonus", "sort_trend_bonus"])
+
+
+def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
+    out = ensure_market_columns(df)
+    out = add_exclusion_flag(out)
+
+    log_count("Raw universe", out)
+
+    universe = out.loc[~out["is_excluded"]].copy()
+    log_count("After exclude ETF/financial", universe)
+
+    universe = universe.loc[
+        (universe["close"] >= MIN_PRICE)
+        & (universe["close"] <= MAX_PRICE)
+    ].copy()
+    log_count("After price range", universe)
+
+    if universe.empty:
+        return universe
+
+    # 先檢查最常出問題的欄位分布
+    print(
+        "[SCAN] Dist stats | turnover>=min:",
+        int((universe["turnover_100m"] >= MIN_TURNOVER_100M).sum()),
+        "| volume_ratio>=min:",
+        int((universe["volume_ratio"] >= MIN_VOLUME_RATIO).sum()),
+        "| volume_avg20>=min:",
+        int((universe["volume_avg20"] >= MIN_AVG_VOLUME_LOT).sum()),
+        "| above_ma20_or_ma60:",
+        int(((universe["close"] > universe["ma20"]) | (universe["close"] > universe["ma60"])).sum()),
+        "| within_ma20_distance:",
+        int((universe["pct_from_ma20"] <= MAX_DISTANCE_FROM_MA20).sum()),
+    )
+
+    liquidity_gate = universe.loc[
+        (universe["turnover_100m"] >= max(MIN_TURNOVER_100M * 0.7, 1.5))
+        & (universe["volume_avg20"] >= max(MIN_AVG_VOLUME_LOT * 0.6, 80))
+    ].copy()
+    log_count("Stage1 liquidity gate", liquidity_gate)
+
+    normal_gate = liquidity_gate.loc[
+        (liquidity_gate["volume_ratio"] >= max(min(MIN_VOLUME_RATIO, 1.0), 0.95))
+        & (
+            (liquidity_gate["close"] > liquidity_gate["ma20"])
+            | (liquidity_gate["close"] > liquidity_gate["ma60"])
+            | (liquidity_gate["macd"] > liquidity_gate["macd_signal"])
+        )
+        & (liquidity_gate["pct_from_ma20"] <= max(MAX_DISTANCE_FROM_MA20, 12))
+    ].copy()
+    log_count("Stage1 normal gate", normal_gate)
+
+    if not normal_gate.empty:
+        return sort_stage1_candidates(normal_gate)
+
+    relaxed_gate_1 = liquidity_gate.loc[
+        (liquidity_gate["volume_ratio"] >= 0.9)
+        & (
+            (liquidity_gate["close"] > liquidity_gate["ma20"] * 0.985)
+            | (liquidity_gate["close"] > liquidity_gate["ma60"] * 0.985)
+            | (liquidity_gate["macd_hist"] > -0.03)
+            | (liquidity_gate["close"] > liquidity_gate["boll_mid"])
+        )
+        & (liquidity_gate["pct_from_ma20"] <= max(MAX_DISTANCE_FROM_MA20 + 8, 20))
+    ].copy()
+    log_count("Stage1 relaxed gate 1", relaxed_gate_1)
+
+    if not relaxed_gate_1.empty:
+        print("[SCAN] Fallback used: relaxed gate 1")
+        return sort_stage1_candidates(relaxed_gate_1)
+
+    relaxed_gate_2 = universe.loc[
+        (universe["turnover_100m"] >= max(MIN_TURNOVER_100M * 0.45, 1.0))
+        & (universe["volume_avg20"] >= max(MIN_AVG_VOLUME_LOT * 0.4, 50))
+        & (universe["volume_ratio"] >= 0.8)
+    ].copy()
+    log_count("Stage1 relaxed gate 2", relaxed_gate_2)
+
+    if not relaxed_gate_2.empty:
+        print("[SCAN] Fallback used: relaxed gate 2")
+        return sort_stage1_candidates(relaxed_gate_2)
+
+    emergency_pool = universe.sort_values(
+        ["turnover_100m", "volume_ratio", "volume_avg20"],
+        ascending=False,
+    ).head(min(SECOND_SCAN_LIMIT, 80)).copy()
+    log_count("Stage1 emergency pool", emergency_pool)
+
+    if not emergency_pool.empty:
+        print("[SCAN] Emergency pool used: please inspect first-stage thresholds or source fields")
+        return emergency_pool
+
+    return universe.head(0).copy()
+
+
+def safe_merge_external(
+    base_df: pd.DataFrame,
+    ext_df: pd.DataFrame,
+    required_cols: list[str],
+    source_name: str,
+) -> pd.DataFrame:
+    out = base_df.copy()
+
+    if ext_df.empty:
+        print(f"[SCAN] {source_name} empty, fill zero")
+        for col in required_cols:
+            if col != "stock_id":
+                out[col] = 0.0
+        return out
+
+    ext = ext_df.copy()
+    if "stock_id" not in ext.columns:
+        print(f"[SCAN] {source_name} missing stock_id, fill zero")
+        for col in required_cols:
+            if col != "stock_id":
+                out[col] = 0.0
+        return out
+
+    ext["stock_id"] = ext["stock_id"].astype(str)
+
+    for col in required_cols:
+        if col not in ext.columns:
+            print(f"[SCAN] {source_name} missing col {col}, fill zero")
+            if col != "stock_id":
+                ext[col] = 0.0
+
+    out = out.merge(ext[required_cols], on="stock_id", how="left")
+
+    for col in required_cols:
+        if col != "stock_id":
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+
+    return out
 
 
 def merge_external_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -144,8 +312,10 @@ def merge_external_data(df: pd.DataFrame) -> pd.DataFrame:
     institutional = get_institutional_data(stock_ids)
     print(f"[SCAN] Institutional rows: {len(institutional)}")
 
-    if not institutional.empty:
-        required = [
+    out = safe_merge_external(
+        out,
+        institutional,
+        [
             "stock_id",
             "foreign_buy_days",
             "investment_buy_days",
@@ -155,54 +325,31 @@ def merge_external_data(df: pd.DataFrame) -> pd.DataFrame:
             "dealer_buy",
             "trust_holding_pct",
             "estimated_inst_cost",
-        ]
-        missing = [c for c in required if c not in institutional.columns]
-        if missing:
-            raise ValueError(f"{INSTITUTIONAL_CSV} / API 缺少欄位：{missing}")
-        institutional["stock_id"] = institutional["stock_id"].astype(str)
-        out = out.merge(institutional[required], on="stock_id", how="left")
-    else:
-        for col in [
-            "foreign_buy_days",
-            "investment_buy_days",
-            "dealer_buy_days",
-            "foreign_buy",
-            "trust_buy",
-            "dealer_buy",
-            "trust_holding_pct",
-            "estimated_inst_cost",
-        ]:
-            out[col] = 0.0
+        ],
+        INSTITUTIONAL_CSV,
+    )
 
     print("[SCAN] Fetch broker data")
     broker = get_broker_data(stock_ids)
     print(f"[SCAN] Broker rows: {len(broker)}")
 
-    if not broker.empty:
-        required = ["stock_id", "main_force_10d", "broker_buy_5d"]
-        missing = [c for c in required if c not in broker.columns]
-        if missing:
-            raise ValueError(f"broker CSV 缺少欄位：{missing}")
-        broker["stock_id"] = broker["stock_id"].astype(str)
-        out = out.merge(broker[required], on="stock_id", how="left")
-    else:
-        out["main_force_10d"] = 0.0
-        out["broker_buy_5d"] = 0.0
+    out = safe_merge_external(
+        out,
+        broker,
+        ["stock_id", "main_force_10d", "broker_buy_5d"],
+        "broker",
+    )
 
     print("[SCAN] Fetch revenue data")
     revenue = get_revenue_data(stock_ids)
     print(f"[SCAN] Revenue rows: {len(revenue)}")
 
-    if not revenue.empty:
-        required = ["stock_id", "revenue_yoy", "revenue_mom"]
-        missing = [c for c in required if c not in revenue.columns]
-        if missing:
-            raise ValueError(f"{REVENUE_CSV} / API 缺少欄位：{missing}")
-        revenue["stock_id"] = revenue["stock_id"].astype(str)
-        out = out.merge(revenue[required], on="stock_id", how="left")
-    else:
-        out["revenue_yoy"] = 0.0
-        out["revenue_mom"] = 0.0
+    out = safe_merge_external(
+        out,
+        revenue,
+        ["stock_id", "revenue_yoy", "revenue_mom"],
+        REVENUE_CSV,
+    )
 
     fill_zero_cols = [
         "foreign_buy_days",
@@ -219,10 +366,15 @@ def merge_external_data(df: pd.DataFrame) -> pd.DataFrame:
         "revenue_mom",
     ]
     for col in fill_zero_cols:
-        out[col] = out[col].fillna(0)
+        if col not in out.columns:
+            out[col] = 0.0
+        out[col] = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    out["institution_force"] = (out["foreign_buy"] + out["trust_buy"]) / out["volume"].replace(0, np.nan)
-    out["trust_force"] = out["trust_buy"] / out["volume"].replace(0, np.nan)
+    volume_base = pd.to_numeric(out["volume"], errors="coerce").replace(0, np.nan)
+
+    out["institution_force"] = (out["foreign_buy"] + out["trust_buy"]) / volume_base
+    out["trust_force"] = out["trust_buy"] / volume_base
+
     out["institution_force"] = out["institution_force"].replace([np.inf, -np.inf], 0).fillna(0)
     out["trust_force"] = out["trust_force"].replace([np.inf, -np.inf], 0).fillna(0)
 
@@ -233,50 +385,59 @@ def merge_external_data(df: pd.DataFrame) -> pd.DataFrame:
 def calc_institution_score(row: pd.Series) -> float:
     score = 0.0
 
-    if row["investment_buy_days"] >= 5:
+    investment_buy_days = float(row.get("investment_buy_days", 0) or 0)
+    foreign_buy_days = float(row.get("foreign_buy_days", 0) or 0)
+    dealer_buy_days = float(row.get("dealer_buy_days", 0) or 0)
+    institution_force = float(row.get("institution_force", 0) or 0)
+    trust_force = float(row.get("trust_force", 0) or 0)
+    trust_holding_pct = float(row.get("trust_holding_pct", 0) or 0)
+    estimated_inst_cost = float(row.get("estimated_inst_cost", 0) or 0)
+    close = float(row.get("close", 0) or 0)
+
+    if investment_buy_days >= 5:
         score += 14
-    elif row["investment_buy_days"] >= 3:
+    elif investment_buy_days >= 3:
         score += 10
-    elif row["investment_buy_days"] >= 2:
+    elif investment_buy_days >= 2:
         score += 6
 
-    if row["foreign_buy_days"] >= 5:
+    if foreign_buy_days >= 5:
         score += 10
-    elif row["foreign_buy_days"] >= 3:
+    elif foreign_buy_days >= 3:
         score += 7
-    elif row["foreign_buy_days"] >= 2:
+    elif foreign_buy_days >= 2:
         score += 4
 
-    if row["dealer_buy_days"] >= 5:
+    if dealer_buy_days >= 5:
         score += 4
-    elif row["dealer_buy_days"] >= 3:
+    elif dealer_buy_days >= 3:
         score += 2
-    elif row["dealer_buy_days"] >= 2:
+    elif dealer_buy_days >= 2:
         score += 1
 
-    if row["institution_force"] >= 0.12:
+    if institution_force >= 0.12:
         score += 12
-    elif row["institution_force"] >= 0.08:
+    elif institution_force >= 0.08:
         score += 8
-    elif row["institution_force"] >= 0.05:
+    elif institution_force >= 0.05:
         score += 4
 
-    if row["trust_force"] >= 0.08:
+    if trust_force >= 0.08:
         score += 10
-    elif row["trust_force"] >= 0.05:
+    elif trust_force >= 0.05:
         score += 6
-    elif row["trust_force"] >= 0.03:
+    elif trust_force >= 0.03:
         score += 3
 
-    if 1 <= row["trust_holding_pct"] <= 3:
+    if 1 <= trust_holding_pct <= 3:
         score += 8
-    elif 3 < row["trust_holding_pct"] <= 8:
+    elif 3 < trust_holding_pct <= 8:
         score += 5
-    elif row["trust_holding_pct"] > 15:
+    elif trust_holding_pct > 15:
         score -= 6
 
-    if row["estimated_inst_cost"] > 0:
-        diff_pct = abs(row["close"] - row["estimated_inst_cost"]) / row["estimated_inst_cost"] * 100
+    if estimated_inst_cost > 0 and close > 0:
+        diff_pct = abs(close - estimated_inst_cost) / estimated_inst_cost * 100
         if diff_pct <= 3:
             score += 8
         elif diff_pct <= 5:
@@ -286,46 +447,56 @@ def calc_institution_score(row: pd.Series) -> float:
 
 
 def calc_main_force_score(row: pd.Series) -> float:
-    if row["main_force_10d"] >= 30000:
+    value = float(row.get("main_force_10d", 0) or 0)
+    if value >= 30000:
         return 15
-    if row["main_force_10d"] >= 15000:
+    if value >= 15000:
         return 10
-    if row["main_force_10d"] >= 5000:
+    if value >= 5000:
         return 6
     return 0.0
 
 
 def calc_broker_score(row: pd.Series) -> float:
-    if row["broker_buy_5d"] >= 10000:
+    value = float(row.get("broker_buy_5d", 0) or 0)
+    if value >= 10000:
         return 12
-    if row["broker_buy_5d"] >= 5000:
+    if value >= 5000:
         return 8
-    if row["broker_buy_5d"] >= 2000:
+    if value >= 2000:
         return 5
     return 0.0
 
 
 def calc_breakout_score(row: pd.Series) -> float:
     score = 0.0
-    if row["close"] > row["platform_high_20d"] > 0:
+    close = float(row.get("close", 0) or 0)
+    p20 = float(row.get("platform_high_20d", 0) or 0)
+    p60 = float(row.get("platform_high_60d", 0) or 0)
+    volume_ratio = float(row.get("volume_ratio", 0) or 0)
+
+    if close > p20 > 0:
         score += 10
-    if row["close"] > row["platform_high_60d"] > 0:
+    if close > p60 > 0:
         score += 15
-    if row["volume_ratio"] >= 2:
+    if volume_ratio >= 2:
         score += 5
     return score
 
 
 def calc_revenue_score(row: pd.Series) -> float:
     score = 0.0
-    if row["revenue_yoy"] >= 30:
+    revenue_yoy = float(row.get("revenue_yoy", 0) or 0)
+    revenue_mom = float(row.get("revenue_mom", 0) or 0)
+
+    if revenue_yoy >= 30:
         score += 10
-    elif row["revenue_yoy"] >= 15:
+    elif revenue_yoy >= 15:
         score += 6
 
-    if row["revenue_mom"] >= 10:
+    if revenue_mom >= 10:
         score += 5
-    elif row["revenue_mom"] >= 5:
+    elif revenue_mom >= 5:
         score += 3
 
     return score
@@ -334,7 +505,6 @@ def calc_revenue_score(row: pd.Series) -> float:
 def calculate_support_resistance(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
-    # 直觀版支撐壓力
     out["near_support"] = np.round(
         np.where(out["ma20"] > 0, np.maximum(out["low_5d"], out["ma20"]), out["low_5d"]),
         2,
@@ -350,19 +520,36 @@ def calculate_support_resistance(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+    out = ensure_market_columns(df)
 
-    # 主題先分
+    for col in [
+        "foreign_buy_days",
+        "investment_buy_days",
+        "dealer_buy_days",
+        "foreign_buy",
+        "trust_buy",
+        "dealer_buy",
+        "trust_holding_pct",
+        "estimated_inst_cost",
+        "main_force_10d",
+        "broker_buy_5d",
+        "revenue_yoy",
+        "revenue_mom",
+        "institution_force",
+        "trust_force",
+    ]:
+        if col not in out.columns:
+            out[col] = 0.0
+        out[col] = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
     out["theme"] = out.apply(lambda x: classify_theme(str(x["name"]), str(x["group"])), axis=1)
 
-    # 先建立欄位，後面 second_wave 才能用
     out["institution_score"] = out.apply(calc_institution_score, axis=1)
     out["main_force_score"] = out.apply(calc_main_force_score, axis=1)
     out["broker_score"] = out.apply(calc_broker_score, axis=1)
     out["breakout_score"] = out.apply(calc_breakout_score, axis=1)
     out["revenue_score"] = out.apply(calc_revenue_score, axis=1)
 
-    # 技術分數
     out["tech_score"] = 0.0
     out.loc[out["close"] > out["ma20"], "tech_score"] += 5
     out.loc[out["close"] > out["ma60"], "tech_score"] += 8
@@ -386,7 +573,6 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
     out.loc[out["close"] > out["boll_upper"], "tech_score"] += 3
     out.loc[out["obv_trend"] > 0, "tech_score"] += 6
 
-    # 剛啟動
     out["score_starting"] = 0.0
     out.loc[(out["close"] > out["ma20"]) & (out["close"] <= out["ma20"] * 1.08), "score_starting"] += 8
     out.loc[(out["volume_ratio"] >= 1.1) & (out["volume_ratio"] < 1.3), "score_starting"] += 6
@@ -400,7 +586,6 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
     out.loc[out["pct_from_ma20"] > 8, "score_starting"] -= 6
     out.loc[out["rsi"] > 78, "score_starting"] -= 6
 
-    # 第二波
     out["score_second_wave"] = 0.0
     out.loc[out["close"] > out["ma20"] * 1.03, "score_second_wave"] += 5
     out.loc[out["close"] > out["ma60"], "score_second_wave"] += 4
@@ -442,7 +627,6 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
 
     out = calculate_support_resistance(out)
 
-    # 預留限制欄位，未來 main/fetcher 串官方資料後可直接顯示
     if "trade_warning" not in out.columns:
         out["trade_warning"] = ""
     if "is_restricted" not in out.columns:
@@ -614,7 +798,7 @@ def run_scan(save: bool = True, progress_callback=None) -> dict:
     print(f"[SCAN] First stage selected: {len(stage1_df)}")
 
     if stage1_df.empty:
-        raise RuntimeError("第一層快篩後沒有股票")
+        raise RuntimeError("第一層快篩後沒有股票（請檢查欄位來源或門檻設定）")
 
     if progress_callback:
         progress_callback(
@@ -645,6 +829,9 @@ def run_scan(save: bool = True, progress_callback=None) -> dict:
         ascending=False,
     ).reset_index(drop=True)
     print(f"[SCAN] Final analyzed rows: {len(analyzed_df)}")
+
+    if analyzed_df.empty:
+        raise RuntimeError("分數計算後沒有股票（請檢查 merge / score 欄位）")
 
     if progress_callback:
         progress_callback(
