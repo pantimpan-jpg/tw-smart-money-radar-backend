@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -65,8 +66,84 @@ def progress_callback(payload: dict[str, Any]) -> None:
     update_scan_progress(**payload)
 
 
+def is_empty_scan_exception(exc: Exception | str) -> bool:
+    text = str(exc).strip()
+    empty_markers = [
+        "第一層快篩後沒有股票",
+        "快篩後沒有股票",
+        "沒有股票通過第一層快篩",
+    ]
+    return any(marker in text for marker in empty_markers)
+
+
+def result_indicates_empty(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return False
+
+    summary = data.get("summary")
+    if isinstance(summary, dict):
+        selected = summary.get("selected")
+        try:
+            if selected is not None and int(selected) == 0:
+                return True
+        except Exception:
+            pass
+
+    all_selected = data.get("all_selected")
+    if isinstance(all_selected, list) and len(all_selected) == 0:
+        return True
+
+    return False
+
+
+def mark_scan_empty(message: str) -> None:
+    global last_scan_error, last_finished_at
+    last_scan_error = None
+    last_finished_at = datetime.now(timezone.utc).isoformat()
+    update_scan_progress(
+        scan_running=False,
+        percent=100,
+        stage="empty",
+        message=message,
+        last_scan_error=None,
+        last_updated=last_finished_at,
+    )
+
+
+def mark_scan_completed() -> None:
+    global last_scan_error, last_finished_at
+    last_scan_error = None
+    last_finished_at = datetime.now(timezone.utc).isoformat()
+    update_scan_progress(
+        scan_running=False,
+        percent=100,
+        stage="completed",
+        message="掃描完成",
+        last_updated=last_finished_at,
+        last_scan_error=None,
+    )
+
+
+def mark_scan_error(message: str) -> None:
+    global last_scan_error, last_finished_at
+    last_scan_error = message
+    last_finished_at = datetime.now(timezone.utc).isoformat()
+    update_scan_progress(
+        scan_running=False,
+        percent=100,
+        stage="error",
+        message=f"掃描失敗：{message}",
+        last_scan_error=message,
+        last_updated=last_finished_at,
+    )
+
+
 def _run_scan_job() -> None:
-    global scan_running, last_scan_error, last_finished_at
+    global scan_running, last_scan_error
 
     with scan_lock:
         if scan_running:
@@ -86,33 +163,31 @@ def _run_scan_job() -> None:
         failed=0,
         skipped=0,
         last_scan_error=None,
+        last_updated=datetime.now(timezone.utc).isoformat(),
     )
 
     try:
         result = run_scan(save=True, progress_callback=progress_callback)
-        last_finished_at = datetime.now(timezone.utc).isoformat()
 
-        update_scan_progress(
-            scan_running=False,
-            percent=100,
-            stage="completed",
-            message="掃描完成",
-            last_updated=last_finished_at,
-            last_scan_error=None,
-        )
+        current = get_scan_progress_snapshot()
+        current_stage = str(current.get("stage") or "").strip().lower()
+
+        if current_stage == "empty" or result_indicates_empty(result):
+            mark_scan_empty("第一層快篩後沒有股票")
+        else:
+            mark_scan_completed()
 
         if isinstance(result, dict):
             print(f"[SCAN] Result keys: {list(result.keys())}")
 
     except Exception as e:
-        last_scan_error = str(e)
-        update_scan_progress(
-            scan_running=False,
-            stage="error",
-            message=f"掃描失敗：{e}",
-            last_scan_error=str(e),
-        )
-        print(traceback.format_exc())
+        err = str(e).strip()
+
+        if is_empty_scan_exception(err):
+            mark_scan_empty("第一層快篩後沒有股票")
+        else:
+            mark_scan_error(err)
+            print(traceback.format_exc())
 
     finally:
         scan_running = False
@@ -742,12 +817,26 @@ def trigger_scan() -> dict[str, Any]:
 @app.get("/api/scan/status")
 def get_scan_status() -> dict[str, Any]:
     snapshot = load_snapshot()
-    updated_at = snapshot.get("updated_at") if snapshot else None
+    snapshot_updated_at = snapshot.get("updated_at") if snapshot else None
 
     status = get_scan_progress_snapshot()
+    stage = str(status.get("stage") or "").strip().lower()
+
     status["scan_running"] = scan_running
-    status["last_scan_error"] = last_scan_error
-    status["last_updated"] = updated_at or last_finished_at or status.get("last_updated")
+
+    if stage == "completed":
+        status["last_updated"] = snapshot_updated_at or last_finished_at or status.get("last_updated")
+        status["last_scan_error"] = None
+    elif stage == "empty":
+        status["last_updated"] = last_finished_at or status.get("last_updated") or snapshot_updated_at
+        status["last_scan_error"] = None
+    elif stage == "error":
+        status["last_updated"] = last_finished_at or status.get("last_updated") or snapshot_updated_at
+        status["last_scan_error"] = last_scan_error or status.get("last_scan_error")
+    else:
+        status["last_updated"] = snapshot_updated_at or last_finished_at or status.get("last_updated")
+        status["last_scan_error"] = last_scan_error or status.get("last_scan_error")
+
     return status
 
 
