@@ -1,374 +1,441 @@
 from __future__ import annotations
 
-import os
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable
+from datetime import date, timedelta
+from typing import Any
 
 import numpy as np
 import pandas as pd
-import twstock
 
-# =========================
-# Runtime settings
-# =========================
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))
-DEFAULT_BATCH_SIZE = int(os.getenv("FETCH_BATCH_SIZE", "10"))
-PROGRESS_EVERY = int(os.getenv("FETCH_PROGRESS_EVERY", "100"))
-
-# 每檔抓資料失敗時的重試次數（總共會跑 1 + retry 次）
-FETCH_RETRY_TIMES = int(os.getenv("FETCH_RETRY_TIMES", "2"))
-FETCH_RETRY_SLEEP = float(os.getenv("FETCH_RETRY_SLEEP", "1.2"))
-
-# 歷史資料起始時間
-HIST_START_YEAR = int(os.getenv("HIST_START_YEAR", "2025"))
-HIST_START_MONTH = int(os.getenv("HIST_START_MONTH", "1"))
-
-# 測試模式
-USE_TEST_STOCKS = os.getenv("USE_TEST_STOCKS", "false").lower() == "true"
-TEST_STOCKS = ["2330", "2317", "2454", "2382", "1301"]
+from finmind_client import finmind_get
 
 
-def get_all_taiwan_stocks():
-    stocks = [
-        info
-        for _, info in twstock.codes.items()
-        if getattr(info, "market", "") in ["上市", "上櫃"]
-        and str(getattr(info, "code", "")).isdigit()
-        and len(str(getattr(info, "code", ""))) == 4
-    ]
-    stocks.sort(key=lambda x: str(getattr(x, "code", "")))
-    return stocks
+PRICE_LOOKBACK_DAYS = 180
+MAX_WORKERS = 12
+
+EXCLUDED_NAME_KEYWORDS = [
+    "ETF",
+    "ETN",
+    "槓桿",
+    "反向",
+    "債券",
+    "期貨",
+    "受益",
+    "基金",
+    "存託",
+]
+
+EXCLUDED_GROUP_KEYWORDS = [
+    "金融保險",
+    "金融",
+    "銀行",
+    "保險",
+    "證券",
+    "金控",
+]
+
+EXCLUDED_STOCK_ID_PREFIXES = []
 
 
-def get_test_stocks():
-    all_codes = get_all_taiwan_stocks()
-    return [x for x in all_codes if str(x.code) in TEST_STOCKS]
-
-
-def get_scan_stocks():
-    if USE_TEST_STOCKS:
-        print("[FETCH] TEST MODE ON: using test stocks only")
-        return get_test_stocks()
-
-    print("[FETCH] FULL MARKET MODE ON: using all Taiwan listed/OTC stocks")
-    return get_all_taiwan_stocks()
-
-
-def emit_progress(progress_callback: Callable[[dict[str, Any]], None] | None, payload: dict[str, Any]) -> None:
-    if not progress_callback:
-        return
+def _to_float(value: Any) -> float:
     try:
-        progress_callback(payload)
-    except Exception as e:
-        print(f"[FETCH][PROGRESS-ERROR] {e}")
+        if value is None or value == "":
+            return 0.0
+        num = float(value)
+        if pd.isna(num):
+            return 0.0
+        return num
+    except Exception:
+        return 0.0
 
 
-def fetch_history_with_retry(code: str):
-    stock = twstock.Stock(code)
-    last_error = None
-
-    for attempt in range(FETCH_RETRY_TIMES + 1):
-        try:
-            return stock.fetch_from(HIST_START_YEAR, HIST_START_MONTH)
-        except Exception as e:
-            last_error = e
-            if attempt < FETCH_RETRY_TIMES:
-                time.sleep(FETCH_RETRY_SLEEP)
-            else:
-                raise last_error
+def _safe_series(df: pd.DataFrame, *candidates: str) -> pd.Series:
+    for col in candidates:
+        if col in df.columns:
+            return pd.to_numeric(df[col], errors="coerce")
+    return pd.Series(dtype=float)
 
 
-def build_stock_result(info, hist) -> dict[str, Any] | None:
-    code = getattr(info, "code", "unknown")
-    name = getattr(info, "name", "")
+def _is_excluded_stock(stock_id: str, name: str, group: str) -> bool:
+    stock_id_text = str(stock_id or "").strip()
+    name_text = str(name or "").upper()
+    group_text = str(group or "").strip()
 
-    if not hist or len(hist) < 60:
-        return None
+    if any(stock_id_text.startswith(prefix) for prefix in EXCLUDED_STOCK_ID_PREFIXES):
+        return True
 
-    df = pd.DataFrame(
-        [
-            {
-                "date": x.date,
-                "open": float(x.open or 0),
-                "high": float(x.high or 0),
-                "low": float(x.low or 0),
-                "close": float(x.close or 0),
-                "capacity": float(x.capacity or 0),
-            }
-            for x in hist
-            if x.close is not None and x.capacity is not None
-        ]
-    )
+    if any(keyword.upper() in name_text for keyword in EXCLUDED_NAME_KEYWORDS):
+        return True
 
-    if df.empty or len(df) < 60:
-        return None
+    if any(keyword in group_text for keyword in EXCLUDED_GROUP_KEYWORDS):
+        return True
 
-    df = df.sort_values("date").reset_index(drop=True)
+    return False
 
-    df["ma20"] = df["close"].rolling(20).mean()
-    df["ma60"] = df["close"].rolling(60).mean()
-    df["volume_avg20"] = df["capacity"].rolling(20).mean() / 1000
 
-    latest = df.iloc[-1]
+def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    close = float(latest["close"])
-    ma20 = float(latest["ma20"]) if pd.notna(latest["ma20"]) else 0.0
-    ma60 = float(latest["ma60"]) if pd.notna(latest["ma60"]) else 0.0
-    volume = float(latest["capacity"]) / 1000
-    volume_avg20 = float(latest["volume_avg20"]) if pd.notna(latest["volume_avg20"]) else 0.0
+    avg_gain = gain.rolling(period, min_periods=period).mean()
+    avg_loss = loss.rolling(period, min_periods=period).mean()
 
-    volume_ratio = volume / volume_avg20 if volume_avg20 > 0 else 0.0
-    turnover_100m = close * volume * 1000 / 100000000
-    pct_from_ma20 = ((close - ma20) / ma20 * 100) if ma20 > 0 else 0.0
-
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    latest_rsi = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
+    return rsi.fillna(50)
 
-    ema12 = df["close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["close"].ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    macd_signal = macd.ewm(span=9, adjust=False).mean()
-    macd_hist = macd - macd_signal
 
-    boll_mid = df["close"].rolling(20).mean()
-    boll_std = df["close"].rolling(20).std()
-    boll_upper = boll_mid + 2 * boll_std
-    boll_lower = boll_mid - 2 * boll_std
+def _macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
 
-    obv = [0.0]
-    for i in range(1, len(df)):
-        if df.loc[i, "close"] > df.loc[i - 1, "close"]:
-            obv.append(obv[-1] + df.loc[i, "capacity"])
-        elif df.loc[i, "close"] < df.loc[i - 1, "close"]:
-            obv.append(obv[-1] - df.loc[i, "capacity"])
-        else:
-            obv.append(obv[-1])
 
-    df["obv"] = obv
-    obv_trend = 1 if len(df) >= 5 and df["obv"].iloc[-1] > df["obv"].iloc[-5] else 0
+def _bollinger(series: pd.Series, period: int = 20, num_std: float = 2.0):
+    mid = series.rolling(period, min_periods=period).mean()
+    std = series.rolling(period, min_periods=period).std(ddof=0)
+    upper = mid + std * num_std
+    lower = mid - std * num_std
+    return mid, upper, lower
 
-    platform_high_20d = float(df["high"].rolling(20).max().iloc[-2]) if len(df) >= 21 else 0.0
-    platform_high_60d = float(df["high"].rolling(60).max().iloc[-2]) if len(df) >= 61 else 0.0
 
+def _obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    direction = np.sign(close.diff().fillna(0))
+    return (direction * volume.fillna(0)).cumsum()
+
+
+def _build_empty_row(stock_id: str, name: str, group: str, skipped_reason: str | None = None) -> dict[str, Any]:
     return {
-        "stock_id": str(code),
-        "name": str(name),
-        "group": str(getattr(info, "group", "")),
-        "close": close,
-        "volume": volume,
-        "volume_ratio": volume_ratio,
-        "volume_avg20": volume_avg20,
-        "turnover_100m": turnover_100m,
-        "ma20": ma20,
-        "ma60": ma60,
-        "pct_from_ma20": pct_from_ma20,
-        "rsi": latest_rsi,
-        "macd": float(macd.iloc[-1]) if pd.notna(macd.iloc[-1]) else 0.0,
-        "macd_signal": float(macd_signal.iloc[-1]) if pd.notna(macd_signal.iloc[-1]) else 0.0,
-        "macd_hist": float(macd_hist.iloc[-1]) if pd.notna(macd_hist.iloc[-1]) else 0.0,
-        "boll_mid": float(boll_mid.iloc[-1]) if pd.notna(boll_mid.iloc[-1]) else 0.0,
-        "boll_upper": float(boll_upper.iloc[-1]) if pd.notna(boll_upper.iloc[-1]) else 0.0,
-        "boll_lower": float(boll_lower.iloc[-1]) if pd.notna(boll_lower.iloc[-1]) else 0.0,
-        "obv_trend": obv_trend,
-        "platform_high_20d": platform_high_20d,
-        "platform_high_60d": platform_high_60d,
+        "stock_id": stock_id,
+        "name": name,
+        "group": group,
+        "theme": "其他",
+        "close": 0.0,
+        "change_pct": 0.0,
+        "volume": 0.0,
+        "turnover_100m": 0.0,
+        "volume_ratio": 0.0,
+        "volume_avg20": 0.0,
+        "ma20": 0.0,
+        "ma60": 0.0,
+        "pct_from_ma20": 999.0,
+        "rsi": 50.0,
+        "macd": 0.0,
+        "macd_signal": 0.0,
+        "macd_hist": 0.0,
+        "boll_mid": 0.0,
+        "boll_upper": 0.0,
+        "obv_trend": 0.0,
+        "platform_high_20d": 0.0,
+        "platform_high_60d": 0.0,
+        "low_5d": 0.0,
+        "low_20d": 0.0,
+        "high_5d": 0.0,
+        "high_20d": 0.0,
+        "trade_warning": "",
+        "is_restricted": False,
+        "fetch_skipped_reason": skipped_reason,
     }
 
 
-def fetch_one_stock(info) -> dict[str, Any] | None:
-    code = getattr(info, "code", "unknown")
-    name = getattr(info, "name", "")
+def _build_stock_snapshot(stock_id: str, name: str, group: str, price_df: pd.DataFrame) -> dict[str, Any]:
+    if price_df.empty:
+        return _build_empty_row(stock_id, name, group, skipped_reason="empty_price")
 
+    df = price_df.copy()
+
+    if "date" not in df.columns:
+        return _build_empty_row(stock_id, name, group, skipped_reason="missing_date")
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).sort_values("date")
+    if df.empty:
+        return _build_empty_row(stock_id, name, group, skipped_reason="invalid_date")
+
+    close = _safe_series(df, "close")
+    open_ = _safe_series(df, "open")
+    high = _safe_series(df, "max", "high")
+    low = _safe_series(df, "min", "low")
+    volume = _safe_series(df, "Trading_Volume", "trading_volume", "volume")
+    trading_money = _safe_series(df, "Trading_money", "trading_money")
+
+    df = df.assign(
+        close_num=close,
+        open_num=open_,
+        high_num=high,
+        low_num=low,
+        volume_num=volume,
+        money_num=trading_money,
+    ).dropna(subset=["close_num"])
+
+    if len(df) < 70:
+        return _build_empty_row(stock_id, name, group, skipped_reason="not_enough_bars")
+
+    close = df["close_num"]
+    open_ = df["open_num"].fillna(close)
+    high = df["high_num"].fillna(close)
+    low = df["low_num"].fillna(close)
+    volume = df["volume_num"].fillna(0)
+    trading_money = df["money_num"].fillna(close * volume)
+
+    ma20 = close.rolling(20).mean()
+    ma60 = close.rolling(60).mean()
+    vol_avg20 = volume.rolling(20).mean()
+
+    rsi14 = _rsi(close, 14)
+    macd_line, macd_signal, macd_hist = _macd(close)
+    boll_mid, boll_upper, _ = _bollinger(close, 20, 2)
+    obv_line = _obv(close, volume)
+
+    latest_close = _to_float(close.iloc[-1])
+    latest_open = _to_float(open_.iloc[-1])
+    latest_high = _to_float(high.iloc[-1])
+    latest_low = _to_float(low.iloc[-1])
+    latest_volume = _to_float(volume.iloc[-1])
+    latest_money = _to_float(trading_money.iloc[-1])
+
+    latest_ma20 = _to_float(ma20.iloc[-1])
+    latest_ma60 = _to_float(ma60.iloc[-1])
+    latest_vol_avg20 = _to_float(vol_avg20.iloc[-1])
+
+    latest_rsi = _to_float(rsi14.iloc[-1])
+    latest_macd = _to_float(macd_line.iloc[-1])
+    latest_macd_signal = _to_float(macd_signal.iloc[-1])
+    latest_macd_hist = _to_float(macd_hist.iloc[-1])
+
+    latest_boll_mid = _to_float(boll_mid.iloc[-1])
+    latest_boll_upper = _to_float(boll_upper.iloc[-1])
+
+    latest_change_pct = ((latest_close - latest_open) / latest_open * 100) if latest_open else 0.0
+    latest_turnover_100m = latest_money / 100000000.0
+    latest_volume_ratio = (latest_volume / latest_vol_avg20) if latest_vol_avg20 else 0.0
+    latest_pct_from_ma20 = ((latest_close - latest_ma20) / latest_ma20 * 100) if latest_ma20 else 999.0
+
+    obv_recent = obv_line.tail(5)
+    obv_trend = 1.0 if len(obv_recent) >= 2 and obv_recent.iloc[-1] > obv_recent.iloc[0] else 0.0
+
+    platform_high_20d = _to_float(high.tail(20).max())
+    platform_high_60d = _to_float(high.tail(60).max())
+    low_5d = _to_float(low.tail(5).min())
+    low_20d = _to_float(low.tail(20).min())
+    high_5d = _to_float(high.tail(5).max())
+    high_20d = _to_float(high.tail(20).max())
+
+    return {
+        "stock_id": stock_id,
+        "name": name,
+        "group": group,
+        "theme": "其他",
+        "close": round(latest_close, 2),
+        "change_pct": round(latest_change_pct, 2),
+        "volume": latest_volume,
+        "turnover_100m": round(latest_turnover_100m, 3),
+        "volume_ratio": round(latest_volume_ratio, 3),
+        "volume_avg20": round(latest_vol_avg20 / 1000.0, 3),
+        "ma20": round(latest_ma20, 2),
+        "ma60": round(latest_ma60, 2),
+        "pct_from_ma20": round(latest_pct_from_ma20, 2),
+        "rsi": round(latest_rsi, 2),
+        "macd": round(latest_macd, 4),
+        "macd_signal": round(latest_macd_signal, 4),
+        "macd_hist": round(latest_macd_hist, 4),
+        "boll_mid": round(latest_boll_mid, 2),
+        "boll_upper": round(latest_boll_upper, 2),
+        "obv_trend": obv_trend,
+        "platform_high_20d": round(platform_high_20d, 2),
+        "platform_high_60d": round(platform_high_60d, 2),
+        "low_5d": round(low_5d, 2),
+        "low_20d": round(low_20d, 2),
+        "high_5d": round(high_5d, 2),
+        "high_20d": round(high_20d, 2),
+        "trade_warning": "",
+        "is_restricted": False,
+        "fetch_skipped_reason": None,
+    }
+
+
+def _fetch_one_stock(stock_id: str, name: str, group: str, start_date: str) -> dict[str, Any]:
     try:
-        hist = fetch_history_with_retry(str(code))
-        return build_stock_result(info, hist)
-    except Exception as e:
-        raise RuntimeError(f"{code} {name}: {e}") from e
+        price_df = finmind_get("TaiwanStockPrice", stock_id, start_date)
+        return _build_stock_snapshot(stock_id, name, group, price_df)
+    except Exception:
+        return _build_empty_row(stock_id, name, group, skipped_reason="fetch_error")
 
 
-def fetch_failed_stocks_once(
-    failed_infos: list[Any],
-    success: int,
-    failed: int,
-    skipped: int,
-    total: int,
-    progress_callback: Callable[[dict[str, Any]], None] | None = None,
-) -> list[dict[str, Any]]:
-    if not failed_infos:
-        return []
+def _normalize_stock_info_df(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
 
-    recovered_rows: list[dict[str, Any]] = []
-    retry_total = len(failed_infos)
+    rename_map = {}
+    if "stock_id" not in out.columns:
+        for c in ["stock_id", "stockId", "data_id"]:
+            if c in out.columns:
+                rename_map[c] = "stock_id"
+                break
 
-    print(f"[FETCH] Retry failed stocks once: {retry_total}")
+    if "stock_name" in out.columns and "name" not in out.columns:
+        rename_map["stock_name"] = "name"
+    if "industry_category" in out.columns and "group" not in out.columns:
+        rename_map["industry_category"] = "group"
+    if "industry" in out.columns and "group" not in out.columns:
+        rename_map["industry"] = "group"
 
-    for idx, info in enumerate(failed_infos, start=1):
-        code = getattr(info, "code", "unknown")
-        name = getattr(info, "name", "")
+    if rename_map:
+        out = out.rename(columns=rename_map)
 
-        try:
-            result = fetch_one_stock(info)
-            if result:
-                recovered_rows.append(result)
-        except Exception as e:
-            print(f"[FETCH][RETRY-ERROR] {code} {name}: {e}")
+    if "name" not in out.columns:
+        out["name"] = ""
+    if "group" not in out.columns:
+        out["group"] = ""
+    if "stock_id" not in out.columns:
+        raise ValueError("TaiwanStockInfo 缺少 stock_id 欄位")
 
-        retry_percent = 80 + int((idx / retry_total) * 5)
-        emit_progress(
-            progress_callback,
-            {
-                "stage": "fetch_retry",
-                "percent": min(retry_percent, 85),
-                "message": f"補跑失敗股票中 {idx}/{retry_total}",
-                "processed": success + failed + skipped,
-                "total": total,
-                "success": success + len(recovered_rows),
-                "failed": max(failed - len(recovered_rows), 0),
-                "skipped": skipped,
-            },
-        )
+    out["stock_id"] = out["stock_id"].astype(str)
+    out["name"] = out["name"].astype(str)
+    out["group"] = out["group"].fillna("").astype(str)
 
-    print(f"[FETCH] Retry recovered rows: {len(recovered_rows)}")
-    return recovered_rows
+    return out
 
 
-def fetch_market_snapshot_parallel(
-    progress_every: int = PROGRESS_EVERY,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    progress_callback: Callable[[dict[str, Any]], None] | None = None,
-) -> pd.DataFrame:
-    print("[FETCH] Loading Taiwan stock list...")
-    codes = get_scan_stocks()
-    total = len(codes)
+def fetch_stock_universe() -> pd.DataFrame:
+    info_df = finmind_get("TaiwanStockInfo")
+    if info_df.empty:
+        raise RuntimeError("抓不到 TaiwanStockInfo")
 
-    print(f"[FETCH] Total stock universe: {total}")
-    print(f"[FETCH] Using max_workers={MAX_WORKERS}")
-    print(f"[FETCH] Using batch_size={batch_size}")
+    info_df = _normalize_stock_info_df(info_df)
 
-    rows: list[dict[str, Any]] = []
-    failed_infos: list[Any] = []
+    # 只留 4 碼股票代碼，先排掉奇怪資料
+    info_df = info_df[info_df["stock_id"].str.match(r"^\d{4}$", na=False)].copy()
+
+    # 最前面先排除 ETF / 金融，直接加速整體掃描
+    info_df["is_excluded"] = info_df.apply(
+        lambda x: _is_excluded_stock(
+            stock_id=str(x["stock_id"]),
+            name=str(x["name"]),
+            group=str(x["group"]),
+        ),
+        axis=1,
+    )
+
+    info_df = info_df[~info_df["is_excluded"]].copy()
+    info_df = info_df.reset_index(drop=True)
+
+    return info_df[["stock_id", "name", "group"]]
+
+
+def fetch_market_snapshot_parallel(progress_callback=None) -> pd.DataFrame:
+    universe_df = fetch_stock_universe()
+    total = len(universe_df)
+
+    if total == 0:
+        return pd.DataFrame()
+
+    start_date = (date.today() - timedelta(days=PRICE_LOOKBACK_DAYS)).isoformat()
+
+    results: list[dict[str, Any]] = []
+    processed = 0
     success = 0
     failed = 0
     skipped = 0
 
-    start_time = time.time()
-
-    emit_progress(
-        progress_callback,
-        {
-            "stage": "fetch",
-            "percent": 0,
-            "message": "開始抓取全市場資料",
-            "processed": 0,
-            "total": total,
-            "success": 0,
-            "failed": 0,
-            "skipped": 0,
-        },
-    )
-
-    for batch_start in range(0, total, batch_size):
-        batch = codes[batch_start: batch_start + batch_size]
-        batch_end = min(batch_start + batch_size, total)
-
-        print(f"[FETCH] Starting batch {batch_start + 1}-{batch_end}/{total}")
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_map = {
-                executor.submit(fetch_one_stock, info): info
-                for info in batch
-            }
-
-            for future in as_completed(future_map):
-                info = future_map[future]
-                code = getattr(info, "code", "unknown")
-                name = getattr(info, "name", "")
-
-                try:
-                    result = future.result()
-                    if result:
-                        rows.append(result)
-                        success += 1
-                    else:
-                        skipped += 1
-                except Exception as e:
-                    failed += 1
-                    failed_infos.append(info)
-                    print(f"[FETCH][ERROR] {code} {name}: {e}")
-
-        processed = success + skipped + failed
-        elapsed = round(time.time() - start_time, 1)
-
-        if processed % progress_every == 0 or batch_end == total:
-            print(
-                f"[FETCH] Progress {processed}/{total} | "
-                f"success={success} skipped={skipped} failed={failed} | "
-                f"elapsed={elapsed}s"
-            )
-
-        fetch_percent = min(80, int((processed / total) * 80)) if total > 0 else 0
-        emit_progress(
-            progress_callback,
+    if progress_callback:
+        progress_callback(
             {
+                "scan_running": True,
                 "stage": "fetch",
-                "percent": fetch_percent,
-                "message": f"抓取市場資料中 {processed}/{total}",
-                "processed": processed,
+                "percent": 0,
+                "message": "開始抓全市場資料",
+                "processed": 0,
                 "total": total,
-                "success": success,
-                "failed": failed,
-                "skipped": skipped,
-            },
+                "success": 0,
+                "failed": 0,
+                "skipped": 0,
+            }
         )
 
-    recovered_rows = fetch_failed_stocks_once(
-        failed_infos=failed_infos,
-        success=success,
-        failed=failed,
-        skipped=skipped,
-        total=total,
-        progress_callback=progress_callback,
-    )
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_map = {
+            executor.submit(
+                _fetch_one_stock,
+                str(row.stock_id),
+                str(row.name),
+                str(row.group),
+                start_date,
+            ): str(row.stock_id)
+            for row in universe_df.itertuples(index=False)
+        }
 
-    if recovered_rows:
-        rows.extend(recovered_rows)
-        success += len(recovered_rows)
-        failed = max(failed - len(recovered_rows), 0)
+        for future in as_completed(future_map):
+            result = future.result()
+            results.append(result)
 
-    total_elapsed = round(time.time() - start_time, 1)
+            processed += 1
 
-    print("[FETCH] Completed market snapshot")
-    print(f"[FETCH] Success rows: {success}")
-    print(f"[FETCH] Skipped rows: {skipped}")
-    print(f"[FETCH] Failed rows: {failed}")
-    print(f"[FETCH] Total elapsed: {total_elapsed}s")
+            reason = result.get("fetch_skipped_reason")
+            if reason is None:
+                success += 1
+            elif reason == "fetch_error":
+                failed += 1
+            else:
+                skipped += 1
 
-    if not rows:
-        print("[FETCH] No rows returned")
+            if progress_callback:
+                percent = min(87, int(processed / total * 87))
+                progress_callback(
+                    {
+                        "scan_running": True,
+                        "stage": "fetch",
+                        "percent": percent,
+                        "message": "抓取全市場資料中",
+                        "processed": processed,
+                        "total": total,
+                        "success": success,
+                        "failed": failed,
+                        "skipped": skipped,
+                    }
+                )
+
+    if not results:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows)
-    df = df.drop_duplicates(subset=["stock_id"], keep="last").reset_index(drop=True)
+    df = pd.DataFrame(results)
 
-    print(f"[FETCH] Final dataframe rows: {len(df)}")
+    # 這裡保留 fetch 成功的資料；fetch_error / bars不足 先不進主流程
+    df = df[df["fetch_skipped_reason"].isna()].copy()
 
-    emit_progress(
-        progress_callback,
-        {
-            "stage": "fetch_done",
-            "percent": 85,
-            "message": "市場資料抓取完成",
-            "processed": total,
-            "total": total,
-            "success": success,
-            "failed": failed,
-            "skipped": skipped,
-        },
-    )
+    if df.empty:
+        return pd.DataFrame()
 
+    numeric_cols = [
+        "close",
+        "change_pct",
+        "volume",
+        "turnover_100m",
+        "volume_ratio",
+        "volume_avg20",
+        "ma20",
+        "ma60",
+        "pct_from_ma20",
+        "rsi",
+        "macd",
+        "macd_signal",
+        "macd_hist",
+        "boll_mid",
+        "boll_upper",
+        "obv_trend",
+        "platform_high_20d",
+        "platform_high_60d",
+        "low_5d",
+        "low_20d",
+        "high_5d",
+        "high_20d",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    df = df.sort_values(["turnover_100m", "volume_ratio"], ascending=False).reset_index(drop=True)
     return df
