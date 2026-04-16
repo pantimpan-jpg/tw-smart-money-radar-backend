@@ -12,6 +12,7 @@ from finmind_client import finmind_get
 
 PRICE_LOOKBACK_DAYS = 180
 MAX_WORKERS = 12
+MIN_UNIVERSE_SIZE = 300
 
 EXCLUDED_NAME_KEYWORDS = [
     "ETF",
@@ -267,7 +268,7 @@ def _fetch_one_stock(stock_id: str, name: str, group: str, start_date: str) -> d
 def _normalize_stock_info_df(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
-    rename_map = {}
+    rename_map: dict[str, str] = {}
 
     if "stock_id" not in out.columns:
         for c in ["stock_id", "stockId", "data_id"]:
@@ -301,13 +302,58 @@ def _normalize_stock_info_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def fetch_stock_universe() -> pd.DataFrame:
-    info_df = finmind_get("TaiwanStockInfo", "2330", "2024-01-01")
-    if info_df.empty:
+def _try_fetch_stock_info(stock_id_arg: Any, start_date_arg: Any) -> pd.DataFrame:
+    try:
+        df = finmind_get("TaiwanStockInfo", stock_id_arg, start_date_arg)
+        if isinstance(df, pd.DataFrame):
+            return df.copy()
+    except Exception as e:
+        print(
+            f"[FETCH] TaiwanStockInfo failed | stock_id={stock_id_arg!r} "
+            f"start_date={start_date_arg!r} err={e}"
+        )
+    return pd.DataFrame()
+
+
+def _fetch_stock_info_full() -> pd.DataFrame:
+    candidates: list[tuple[str, pd.DataFrame]] = [
+        ('("", "")', _try_fetch_stock_info("", "")),
+        ('("", "2024-01-01")', _try_fetch_stock_info("", "2024-01-01")),
+        ("(None, None)", _try_fetch_stock_info(None, None)),
+        ('(None, "2024-01-01")', _try_fetch_stock_info(None, "2024-01-01")),
+    ]
+
+    for label, df in candidates:
+        print(f"[FETCH] TaiwanStockInfo candidate {label}: {len(df)} rows")
+
+    best_label, best_df = max(candidates, key=lambda item: len(item[1]))
+
+    print(f"[FETCH] TaiwanStockInfo selected candidate {best_label}: {len(best_df)} rows")
+
+    if best_df.empty:
         raise RuntimeError("抓不到 TaiwanStockInfo")
 
+    return best_df
+
+
+def fetch_stock_universe() -> pd.DataFrame:
+    info_df = _fetch_stock_info_full()
     info_df = _normalize_stock_info_df(info_df)
+
+    print(f"[FETCH] TaiwanStockInfo raw rows: {len(info_df)}")
+
     info_df = info_df[info_df["stock_id"].str.match(r"^\d{4}$", na=False)].copy()
+    print(f"[FETCH] 4-digit stock rows: {len(info_df)}")
+
+    info_df = info_df.drop_duplicates(subset=["stock_id"], keep="first").copy()
+    print(f"[FETCH] deduped 4-digit stock rows: {len(info_df)}")
+
+    if len(info_df) < MIN_UNIVERSE_SIZE:
+        sample_ids = info_df["stock_id"].head(20).tolist()
+        raise RuntimeError(
+            f"TaiwanStockInfo 股票母體異常，只有 {len(info_df)} 檔。"
+            f"sample={sample_ids}"
+        )
 
     info_df["is_excluded"] = info_df.apply(
         lambda x: _is_excluded_stock(
@@ -318,8 +364,20 @@ def fetch_stock_universe() -> pd.DataFrame:
         axis=1,
     )
 
+    excluded_count = int(info_df["is_excluded"].sum())
+    print(f"[FETCH] excluded ETF/financial count: {excluded_count}")
+
     info_df = info_df[~info_df["is_excluded"]].copy()
     info_df = info_df.reset_index(drop=True)
+
+    print(f"[FETCH] final universe rows: {len(info_df)}")
+
+    if len(info_df) < MIN_UNIVERSE_SIZE:
+        sample_ids = info_df["stock_id"].head(20).tolist()
+        raise RuntimeError(
+            f"排除 ETF/金融後股票母體異常，只有 {len(info_df)} 檔。"
+            f"sample={sample_ids}"
+        )
 
     return info_df[["stock_id", "name", "group"]]
 
@@ -338,6 +396,8 @@ def fetch_market_snapshot_parallel(progress_callback=None) -> pd.DataFrame:
     success = 0
     failed = 0
     skipped = 0
+
+    print(f"[FETCH] start market snapshot | universe={total} | lookback_days={PRICE_LOOKBACK_DAYS}")
 
     if progress_callback:
         progress_callback(
@@ -380,6 +440,12 @@ def fetch_market_snapshot_parallel(progress_callback=None) -> pd.DataFrame:
             else:
                 skipped += 1
 
+            if processed % 200 == 0 or processed == total:
+                print(
+                    f"[FETCH] progress processed={processed}/{total} "
+                    f"success={success} failed={failed} skipped={skipped}"
+                )
+
             if progress_callback:
                 percent = min(87, int(processed / total * 87))
                 progress_callback(
@@ -400,7 +466,14 @@ def fetch_market_snapshot_parallel(progress_callback=None) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(results)
-    df = df[df["fetch_skipped_reason"].isna()].copy()
+    print(f"[FETCH] raw snapshot results rows: {len(df)}")
+
+    if "fetch_skipped_reason" in df.columns:
+        reason_counts = df["fetch_skipped_reason"].fillna("ok").value_counts(dropna=False).to_dict()
+        print(f"[FETCH] skipped reason counts: {reason_counts}")
+        df = df[df["fetch_skipped_reason"].isna()].copy()
+
+    print(f"[FETCH] usable snapshot rows: {len(df)}")
 
     if df.empty:
         return pd.DataFrame()
