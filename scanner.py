@@ -22,40 +22,115 @@ from finmind_client import get_broker_data, get_institutional_data, get_revenue_
 from storage import dataframe_to_records, save_snapshot
 
 
-def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
-    cond = (
-        (df["close"] >= MIN_PRICE)
-        & (df["close"] <= MAX_PRICE)
-        & (df["turnover_100m"] >= MIN_TURNOVER_100M)
-        & (df["volume_ratio"] >= max(MIN_VOLUME_RATIO, 1.08))
-        & (df["volume_avg20"] >= MIN_AVG_VOLUME_LOT)
-        & ((df["close"] > df["ma20"]) | (df["close"] > df["ma60"]))
-        & (df["pct_from_ma20"] <= MAX_DISTANCE_FROM_MA20)
-    )
-    filtered = df.loc[cond].copy()
-    filtered = filtered.sort_values(["turnover_100m", "volume_ratio"], ascending=False)
-    return filtered.head(SECOND_SCAN_LIMIT).copy()
+EXCLUDED_NAME_KEYWORDS = [
+    "ETF",
+    "ETN",
+    "槓桿",
+    "反向",
+    "債券",
+    "期貨",
+    "受益",
+    "基金",
+    "存託",
+]
+
+EXCLUDED_GROUP_KEYWORDS = [
+    "金融保險",
+    "金融",
+    "銀行",
+    "保險",
+    "證券",
+    "金控",
+]
+
+THEME_RULES: dict[str, list[str]] = {
+    "記憶體": [
+        "記憶體", "DRAM", "NAND", "NOR", "快閃記憶體", "SSD"
+    ],
+    "ABF載板": [
+        "ABF", "載板", "IC載板"
+    ],
+    "散熱": [
+        "散熱", "熱導管", "均熱片", "散熱模組", "風扇"
+    ],
+    "PCB": [
+        "PCB", "印刷電路板", "銅箔基板", "CCL", "HDI", "軟板"
+    ],
+    "AI伺服器": [
+        "AI", "伺服器", "SERVER", "GPU", "ASIC", "資料中心"
+    ],
+    "CPO/矽光子": [
+        "CPO", "矽光子", "光通訊", "光模組", "高速光"
+    ],
+    "網通": [
+        "網通", "網路", "交換器", "路由器", "WIFI", "乙太網路"
+    ],
+    "低軌衛星": [
+        "低軌", "衛星", "通訊天線", "太空", "衛星通訊"
+    ],
+    "被動元件": [
+        "被動元件", "MLCC", "電感", "電容", "電阻"
+    ],
+    "電源/BBU": [
+        "電源", "BBU", "UPS", "電池備援", "電源供應器"
+    ],
+    "面板": [
+        "面板", "顯示器", "LCD", "OLED", "觸控"
+    ],
+}
+
+
+def is_excluded_stock(name: str, group: str) -> bool:
+    name_text = str(name or "").upper()
+    group_text = str(group or "")
+
+    if any(keyword.upper() in name_text for keyword in EXCLUDED_NAME_KEYWORDS):
+        return True
+
+    if any(keyword in group_text for keyword in EXCLUDED_GROUP_KEYWORDS):
+        return True
+
+    return False
 
 
 def classify_theme(name: str, group: str) -> str:
     text = f"{name} {group}".upper()
-    pcb_keywords = ["PCB", "載板", "ABF", "銅箔", "CCL"]
-    thermal_keywords = ["散熱", "均熱片", "熱導管", "風扇"]
-    cpo_keywords = ["CPO", "矽光子", "光通訊", "光模組"]
-    ai_keywords = ["AI", "伺服器", "GPU", "ASIC"]
-    satellite_keywords = ["低軌", "衛星", "天線", "通訊"]
 
-    if any(k.upper() in text for k in pcb_keywords):
-        return "PCB"
-    if any(k.upper() in text for k in thermal_keywords):
-        return "散熱"
-    if any(k.upper() in text for k in cpo_keywords):
-        return "CPO"
-    if any(k.upper() in text for k in ai_keywords):
-        return "AI"
-    if any(k.upper() in text for k in satellite_keywords):
-        return "衛星"
+    for theme, keywords in THEME_RULES.items():
+        for keyword in keywords:
+            if keyword.upper() in text:
+                return theme
+
     return "其他"
+
+
+def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    if "name" not in out.columns:
+        out["name"] = ""
+    if "group" not in out.columns:
+        out["group"] = ""
+
+    out["is_excluded"] = out.apply(
+        lambda x: is_excluded_stock(str(x["name"]), str(x["group"])),
+        axis=1,
+    )
+
+    cond = (
+        (~out["is_excluded"])
+        & (out["close"] >= MIN_PRICE)
+        & (out["close"] <= MAX_PRICE)
+        & (out["turnover_100m"] >= MIN_TURNOVER_100M)
+        & (out["volume_ratio"] >= max(MIN_VOLUME_RATIO, 1.08))
+        & (out["volume_avg20"] >= MIN_AVG_VOLUME_LOT)
+        & ((out["close"] > out["ma20"]) | (out["close"] > out["ma60"]))
+        & (out["pct_from_ma20"] <= MAX_DISTANCE_FROM_MA20)
+    )
+
+    filtered = out.loc[cond].copy()
+    filtered = filtered.sort_values(["turnover_100m", "volume_ratio"], ascending=False)
+    return filtered.head(SECOND_SCAN_LIMIT).copy()
 
 
 def merge_external_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -157,6 +232,7 @@ def merge_external_data(df: pd.DataFrame) -> pd.DataFrame:
 
 def calc_institution_score(row: pd.Series) -> float:
     score = 0.0
+
     if row["investment_buy_days"] >= 5:
         score += 14
     elif row["investment_buy_days"] >= 3:
@@ -255,19 +331,38 @@ def calc_revenue_score(row: pd.Series) -> float:
     return score
 
 
+def calculate_support_resistance(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    # 直觀版支撐壓力
+    out["near_support"] = np.round(
+        np.where(out["ma20"] > 0, np.maximum(out["low_5d"], out["ma20"]), out["low_5d"]),
+        2,
+    )
+    out["strong_support"] = np.round(
+        np.where(out["ma60"] > 0, np.minimum(out["low_20d"], out["ma60"]), out["low_20d"]),
+        2,
+    )
+    out["near_resistance"] = np.round(out["high_5d"], 2)
+    out["strong_resistance"] = np.round(np.maximum(out["high_20d"], out["high_5d"] * 1.03), 2)
+
+    return out
+
+
 def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
-    out["pct_5d"] = 0.0
-    out["pct_20d"] = 0.0
-
+    # 主題先分
     out["theme"] = out.apply(lambda x: classify_theme(str(x["name"]), str(x["group"])), axis=1)
+
+    # 先建立欄位，後面 second_wave 才能用
     out["institution_score"] = out.apply(calc_institution_score, axis=1)
     out["main_force_score"] = out.apply(calc_main_force_score, axis=1)
     out["broker_score"] = out.apply(calc_broker_score, axis=1)
     out["breakout_score"] = out.apply(calc_breakout_score, axis=1)
     out["revenue_score"] = out.apply(calc_revenue_score, axis=1)
 
+    # 技術分數
     out["tech_score"] = 0.0
     out.loc[out["close"] > out["ma20"], "tech_score"] += 5
     out.loc[out["close"] > out["ma60"], "tech_score"] += 8
@@ -291,6 +386,7 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
     out.loc[out["close"] > out["boll_upper"], "tech_score"] += 3
     out.loc[out["obv_trend"] > 0, "tech_score"] += 6
 
+    # 剛啟動
     out["score_starting"] = 0.0
     out.loc[(out["close"] > out["ma20"]) & (out["close"] <= out["ma20"] * 1.08), "score_starting"] += 8
     out.loc[(out["volume_ratio"] >= 1.1) & (out["volume_ratio"] < 1.3), "score_starting"] += 6
@@ -304,6 +400,7 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
     out.loc[out["pct_from_ma20"] > 8, "score_starting"] -= 6
     out.loc[out["rsi"] > 78, "score_starting"] -= 6
 
+    # 第二波
     out["score_second_wave"] = 0.0
     out.loc[out["close"] > out["ma20"] * 1.03, "score_second_wave"] += 5
     out.loc[out["close"] > out["ma60"], "score_second_wave"] += 4
@@ -341,11 +438,16 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
         + np.where(out["rsi"] >= 70, 1, 0)
     )
 
-    out["radar_tag"] = np.where(
-        starting_bias >= second_wave_bias,
-        "剛啟動",
-        "可能第二波",
-    )
+    out["radar_tag"] = np.where(starting_bias >= second_wave_bias, "剛啟動", "可能第二波")
+
+    out = calculate_support_resistance(out)
+
+    # 預留限制欄位，未來 main/fetcher 串官方資料後可直接顯示
+    if "trade_warning" not in out.columns:
+        out["trade_warning"] = ""
+    if "is_restricted" not in out.columns:
+        out["is_restricted"] = False
+
     return out
 
 
@@ -398,37 +500,16 @@ def build_reason_and_targets(row: pd.Series) -> dict:
     if row.get("obv_trend", 0) > 0:
         reasons.append("OBV 走升")
 
-    close = float(row.get("close", 0) or 0)
-    ph20 = float(row.get("platform_high_20d", 0) or 0)
-    ph60 = float(row.get("platform_high_60d", 0) or 0)
-    boll_upper = float(row.get("boll_upper", 0) or 0)
-
-    resistance_candidates = [x for x in [ph20, ph60, boll_upper] if x > 0]
-    resistance_candidates = sorted(set(round(x, 2) for x in resistance_candidates))
-
-    if resistance_candidates:
-        above_close = [x for x in resistance_candidates if x >= close]
-        if above_close:
-            resistance_low = above_close[0]
-            resistance_high = above_close[1] if len(above_close) >= 2 else round(resistance_low * 1.03, 2)
-        else:
-            resistance_low = max(resistance_candidates)
-            resistance_high = round(resistance_low * 1.05, 2)
-    else:
-        resistance_low = round(close * 1.05, 2)
-        resistance_high = round(close * 1.08, 2)
-
-    target_price = round((resistance_low + resistance_high) / 2, 2)
-
     short_reasons = reasons[:4]
     reason_text = "；".join(short_reasons) if short_reasons else "符合模型條件"
 
     return {
         "reason_text": reason_text,
         "reason_list": reasons[:8],
-        "target_price": target_price,
-        "resistance_low": round(resistance_low, 2),
-        "resistance_high": round(resistance_high, 2),
+        "near_support": row.get("near_support"),
+        "strong_support": row.get("strong_support"),
+        "near_resistance": row.get("near_resistance"),
+        "strong_resistance": row.get("strong_resistance"),
     }
 
 
