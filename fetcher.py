@@ -1,415 +1,499 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, timedelta
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 
-from finmind_client import finmind_get
+from fetcher import fetch_market_snapshot_parallel
+from storage import save_snapshot
+
+ProgressCallback = Callable[[dict[str, Any]], None] | None
 
 
-PRICE_LOOKBACK_DAYS = 180
-MAX_WORKERS = 12
+THEME_BY_STOCK_ID: dict[str, str] = {
+    # 記憶體
+    "2408": "記憶體",
+    "2344": "記憶體",
+    "2337": "記憶體",
+    "3260": "記憶體",
+    "8299": "記憶體",
+    "4967": "記憶體",
+    # ABF / 載板
+    "3189": "ABF載板",
+    "8046": "ABF載板",
+    "3037": "ABF載板",
+    # 散熱
+    "3017": "散熱",
+    "3324": "散熱",
+    "6230": "散熱",
+    "3653": "散熱",
+    # PCB / CCL
+    "2383": "PCB",
+    "2368": "PCB",
+    "5469": "PCB",
+    "6274": "PCB",
+    "4958": "PCB",
+    "6191": "PCB",
+    "8046": "ABF載板",
+    "3037": "ABF載板",
+    "3189": "ABF載板",
+    # 半導體設備 / 測試
+    "3131": "半導體設備",
+    "3413": "半導體設備",
+    "3583": "半導體設備",
+    "8028": "半導體設備",
+    "6640": "半導體設備",
+    # 矽光子 / 光通訊
+    "4979": "光通訊",
+    "3081": "光通訊",
+    "3363": "光通訊",
+    "3234": "光通訊",
+    "4908": "光通訊",
+    # 網通
+    "5388": "網通",
+    "3596": "網通",
+    "2345": "網通",
+    "2419": "網通",
+    "6285": "網通",
+    # AI 伺服器 / ODM
+    "3231": "AI伺服器",
+    "6669": "AI伺服器",
+    "2356": "AI伺服器",
+    "2382": "AI伺服器",
+    "2317": "AI伺服器",
+    "6669": "AI伺服器",
+    # 機殼 / 組裝
+    "8210": "機殼",
+    "3013": "機殼",
+    "6117": "機殼",
+    # 電源 / UPS
+    "2308": "電源",
+    "3023": "電源",
+    "6121": "電源",
+    # 被動元件 / MLCC
+    "2327": "MLCC",
+    "6173": "MLCC",
+    "2492": "被動元件",
+    "3042": "被動元件",
+    # 面板
+    "2409": "面板",
+    "3481": "面板",
+    # 塑化
+    "1301": "塑化",
+    "1303": "塑化",
+    "1326": "塑化",
+    "6505": "塑化",
+    # 重電 / 電力設備
+    "1519": "重電",
+    "1503": "重電",
+    "1513": "重電",
+    "1584": "重電",
+    "4526": "重電",
+    # 工具機 / 自動化
+    "2049": "工具機",
+    "4510": "工具機",
+    "1536": "自動化",
+    "1597": "自動化",
+    # 航運
+    "2603": "航運",
+    "2609": "航運",
+    "2615": "航運",
+    # 鋼鐵
+    "2002": "鋼鐵",
+    "2027": "鋼鐵",
+    "2034": "鋼鐵",
+    # 軍工 / 航太
+    "2634": "軍工航太",
+    "8222": "軍工航太",
+    "4572": "軍工航太",
+    # 生技
+    "4743": "生技",
+    "6446": "生技",
+    "6472": "生技",
+}
 
-EXCLUDED_NAME_KEYWORDS = [
-    "ETF",
-    "ETN",
-    "槓桿",
-    "反向",
-    "債券",
-    "期貨",
-    "受益",
-    "基金",
-    "存託",
+THEME_GROUP_RULES: list[tuple[list[str], str]] = [
+    (["半導體"], "半導體"),
+    (["電子零組件"], "電子零組件"),
+    (["通信網路"], "網通"),
+    (["光電"], "光電"),
+    (["電腦及週邊"], "AI伺服器"),
+    (["其他電子"], "其他電子"),
+    (["塑膠"], "塑化"),
+    (["電機機械"], "電機機械"),
+    (["鋼鐵"], "鋼鐵"),
+    (["航運"], "航運"),
+    (["生技"], "生技"),
 ]
 
-EXCLUDED_GROUP_KEYWORDS = [
-    "金融保險",
-    "金融",
-    "銀行",
-    "保險",
-    "證券",
-    "金控",
+THEME_NAME_RULES: list[tuple[list[str], str]] = [
+    (["南亞科", "華邦電", "旺宏", "威剛", "創見", "品安"], "記憶體"),
+    (["欣興", "南電", "景碩"], "ABF載板"),
+    (["奇鋐", "雙鴻", "力致", "建準", "泰碩"], "散熱"),
+    (["金像電", "台光電", "台燿", "高技", "敬鵬", "華通", "欣興"], "PCB"),
+    (["聯亞", "上詮", "光聖", "眾達", "波若威"], "光通訊"),
+    (["智邦", "中磊", "啟碁", "明泰", "正文"], "網通"),
+    (["英業達", "緯創", "廣達", "技嘉", "微星", "仁寶", "鴻海"], "AI伺服器"),
+    (["國巨", "華新科", "禾伸堂", "旺詮"], "被動元件"),
+    (["群創", "友達"], "面板"),
+    (["南亞", "台塑", "台化"], "塑化"),
+    (["亞力", "士電", "華城", "中興電"], "重電"),
+    (["東台", "高鋒", "瀧澤科"], "工具機"),
 ]
 
-EXCLUDED_STOCK_ID_PREFIXES: list[str] = []
+
+def _update_progress(progress_callback: ProgressCallback, payload: dict[str, Any]) -> None:
+    if progress_callback:
+        progress_callback(payload)
 
 
-def _to_float(value: Any) -> float:
+def _safe_float(value: Any) -> float:
     try:
         if value is None or value == "":
             return 0.0
-        num = float(value)
-        if pd.isna(num):
+        x = float(value)
+        if pd.isna(x):
             return 0.0
-        return num
+        return x
     except Exception:
         return 0.0
 
 
-def _safe_series(df: pd.DataFrame, *candidates: str) -> pd.Series:
-    for col in candidates:
-        if col in df.columns:
-            return pd.to_numeric(df[col], errors="coerce")
-    return pd.Series(dtype=float)
+def _clean_numeric(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    out = df.copy()
+    for col in columns:
+        if col not in out.columns:
+            out[col] = 0.0
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+    return out
 
 
-def _is_excluded_stock(stock_id: str, name: str, group: str) -> bool:
-    stock_id_text = str(stock_id or "").strip()
-    name_text = str(name or "").upper()
-    group_text = str(group or "").strip()
+def _assign_theme(row: pd.Series) -> str:
+    stock_id = str(row.get("stock_id", ""))
+    name = str(row.get("name", "") or "")
+    group = str(row.get("group", "") or "")
 
-    if any(stock_id_text.startswith(prefix) for prefix in EXCLUDED_STOCK_ID_PREFIXES):
-        return True
+    if stock_id in THEME_BY_STOCK_ID:
+        return THEME_BY_STOCK_ID[stock_id]
 
-    if any(keyword.upper() in name_text for keyword in EXCLUDED_NAME_KEYWORDS):
-        return True
+    for keywords, theme in THEME_NAME_RULES:
+        if any(k in name for k in keywords):
+            return theme
 
-    if any(keyword in group_text for keyword in EXCLUDED_GROUP_KEYWORDS):
-        return True
+    for keywords, theme in THEME_GROUP_RULES:
+        if any(k in group for k in keywords):
+            return theme
 
-    return False
-
-
-def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.rolling(period, min_periods=period).mean()
-    avg_loss = loss.rolling(period, min_periods=period).mean()
-
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
+    return "其他"
 
 
-def _macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    ema_fast = series.ewm(span=fast, adjust=False).mean()
-    ema_slow = series.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
-
-
-def _bollinger(series: pd.Series, period: int = 20, num_std: float = 2.0):
-    mid = series.rolling(period, min_periods=period).mean()
-    std = series.rolling(period, min_periods=period).std(ddof=0)
-    upper = mid + std * num_std
-    lower = mid - std * num_std
-    return mid, upper, lower
-
-
-def _obv(close: pd.Series, volume: pd.Series) -> pd.Series:
-    direction = np.sign(close.diff().fillna(0))
-    return (direction * volume.fillna(0)).cumsum()
-
-
-def _build_empty_row(stock_id: str, name: str, group: str, skipped_reason: str | None = None) -> dict[str, Any]:
-    return {
-        "stock_id": stock_id,
-        "name": name,
-        "group": group,
-        "theme": "其他",
-        "close": 0.0,
-        "change_pct": 0.0,
-        "volume": 0.0,
-        "turnover_100m": 0.0,
-        "volume_ratio": 0.0,
-        "volume_avg20": 0.0,
-        "ma20": 0.0,
-        "ma60": 0.0,
-        "pct_from_ma20": 999.0,
-        "rsi": 50.0,
-        "macd": 0.0,
-        "macd_signal": 0.0,
-        "macd_hist": 0.0,
-        "boll_mid": 0.0,
-        "boll_upper": 0.0,
-        "obv_trend": 0.0,
-        "platform_high_20d": 0.0,
-        "platform_high_60d": 0.0,
-        "low_5d": 0.0,
-        "low_20d": 0.0,
-        "high_5d": 0.0,
-        "high_20d": 0.0,
-        "trade_warning": "",
-        "is_restricted": False,
-        "fetch_skipped_reason": skipped_reason,
-    }
-
-
-def _build_stock_snapshot(stock_id: str, name: str, group: str, price_df: pd.DataFrame) -> dict[str, Any]:
-    if price_df.empty:
-        return _build_empty_row(stock_id, name, group, skipped_reason="empty_price")
-
-    df = price_df.copy()
-
-    if "date" not in df.columns:
-        return _build_empty_row(stock_id, name, group, skipped_reason="missing_date")
-
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"]).sort_values("date")
-    if df.empty:
-        return _build_empty_row(stock_id, name, group, skipped_reason="invalid_date")
-
-    close = _safe_series(df, "close")
-    open_ = _safe_series(df, "open")
-    high = _safe_series(df, "max", "high")
-    low = _safe_series(df, "min", "low")
-    volume = _safe_series(df, "Trading_Volume", "trading_volume", "volume")
-    trading_money = _safe_series(df, "Trading_money", "trading_money")
-
-    df = df.assign(
-        close_num=close,
-        open_num=open_,
-        high_num=high,
-        low_num=low,
-        volume_num=volume,
-        money_num=trading_money,
-    ).dropna(subset=["close_num"])
-
-    if len(df) < 70:
-        return _build_empty_row(stock_id, name, group, skipped_reason="not_enough_bars")
-
-    close = df["close_num"]
-    open_ = df["open_num"].fillna(close)
-    high = df["high_num"].fillna(close)
-    low = df["low_num"].fillna(close)
-    volume = df["volume_num"].fillna(0)
-    trading_money = df["money_num"].fillna(close * volume)
-
-    ma20 = close.rolling(20).mean()
-    ma60 = close.rolling(60).mean()
-    vol_avg20 = volume.rolling(20).mean()
-
-    rsi14 = _rsi(close, 14)
-    macd_line, macd_signal, macd_hist = _macd(close)
-    boll_mid, boll_upper, _ = _bollinger(close, 20, 2)
-    obv_line = _obv(close, volume)
-
-    latest_close = _to_float(close.iloc[-1])
-    latest_open = _to_float(open_.iloc[-1])
-    latest_volume = _to_float(volume.iloc[-1])
-    latest_money = _to_float(trading_money.iloc[-1])
-
-    latest_ma20 = _to_float(ma20.iloc[-1])
-    latest_ma60 = _to_float(ma60.iloc[-1])
-    latest_vol_avg20 = _to_float(vol_avg20.iloc[-1])
-
-    latest_rsi = _to_float(rsi14.iloc[-1])
-    latest_macd = _to_float(macd_line.iloc[-1])
-    latest_macd_signal = _to_float(macd_signal.iloc[-1])
-    latest_macd_hist = _to_float(macd_hist.iloc[-1])
-
-    latest_boll_mid = _to_float(boll_mid.iloc[-1])
-    latest_boll_upper = _to_float(boll_upper.iloc[-1])
-
-    latest_change_pct = ((latest_close - latest_open) / latest_open * 100) if latest_open else 0.0
-    latest_turnover_100m = latest_money / 100000000.0
-    latest_volume_ratio = (latest_volume / latest_vol_avg20) if latest_vol_avg20 else 0.0
-    latest_pct_from_ma20 = ((latest_close - latest_ma20) / latest_ma20 * 100) if latest_ma20 else 999.0
-
-    obv_recent = obv_line.tail(5)
-    obv_trend = 1.0 if len(obv_recent) >= 2 and obv_recent.iloc[-1] > obv_recent.iloc[0] else 0.0
-
-    platform_high_20d = _to_float(high.tail(20).max())
-    platform_high_60d = _to_float(high.tail(60).max())
-    low_5d = _to_float(low.tail(5).min())
-    low_20d = _to_float(low.tail(20).min())
-    high_5d = _to_float(high.tail(5).max())
-    high_20d = _to_float(high.tail(20).max())
-
-    return {
-        "stock_id": stock_id,
-        "name": name,
-        "group": group,
-        "theme": "其他",
-        "close": round(latest_close, 2),
-        "change_pct": round(latest_change_pct, 2),
-        "volume": latest_volume,
-        "turnover_100m": round(latest_turnover_100m, 3),
-        "volume_ratio": round(latest_volume_ratio, 3),
-        "volume_avg20": round(latest_vol_avg20 / 1000.0, 3),
-        "ma20": round(latest_ma20, 2),
-        "ma60": round(latest_ma60, 2),
-        "pct_from_ma20": round(latest_pct_from_ma20, 2),
-        "rsi": round(latest_rsi, 2),
-        "macd": round(latest_macd, 4),
-        "macd_signal": round(latest_macd_signal, 4),
-        "macd_hist": round(latest_macd_hist, 4),
-        "boll_mid": round(latest_boll_mid, 2),
-        "boll_upper": round(latest_boll_upper, 2),
-        "obv_trend": obv_trend,
-        "platform_high_20d": round(platform_high_20d, 2),
-        "platform_high_60d": round(platform_high_60d, 2),
-        "low_5d": round(low_5d, 2),
-        "low_20d": round(low_20d, 2),
-        "high_5d": round(high_5d, 2),
-        "high_20d": round(high_20d, 2),
-        "trade_warning": "",
-        "is_restricted": False,
-        "fetch_skipped_reason": None,
-    }
-
-
-def _fetch_one_stock(stock_id: str, name: str, group: str, start_date: str) -> dict[str, Any]:
-    try:
-        price_df = finmind_get("TaiwanStockPrice", stock_id, start_date)
-        return _build_stock_snapshot(stock_id, name, group, price_df)
-    except Exception:
-        return _build_empty_row(stock_id, name, group, skipped_reason="fetch_error")
-
-
-def _normalize_stock_info_df(df: pd.DataFrame) -> pd.DataFrame:
+def _compute_support_resistance(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
-    rename_map = {}
+    if "low_5d" not in out.columns:
+        out["low_5d"] = 0.0
+    if "low_20d" not in out.columns:
+        out["low_20d"] = 0.0
+    if "high_5d" not in out.columns:
+        out["high_5d"] = 0.0
+    if "high_20d" not in out.columns:
+        out["high_20d"] = 0.0
+    if "ma20" not in out.columns:
+        out["ma20"] = 0.0
+    if "ma60" not in out.columns:
+        out["ma60"] = 0.0
 
-    if "stock_id" not in out.columns:
-        for c in ["stock_id", "stockId", "data_id"]:
-            if c in out.columns:
-                rename_map[c] = "stock_id"
-                break
+    out["near_support"] = np.where(
+        out["ma20"] > 0,
+        np.maximum(out["low_5d"], out["ma20"] * 0.985),
+        out["low_5d"],
+    )
+    out["strong_support"] = np.where(
+        out["ma60"] > 0,
+        np.minimum(out["low_20d"], out["ma60"]),
+        out["low_20d"],
+    )
+    out["near_resistance"] = out["high_5d"]
+    out["strong_resistance"] = np.where(
+        out["high_20d"] > 0,
+        np.maximum(out["high_20d"], out["high_5d"] * 1.03),
+        out["high_5d"] * 1.03,
+    )
 
-    if "stock_name" in out.columns and "name" not in out.columns:
-        rename_map["stock_name"] = "name"
-
-    if "industry_category" in out.columns and "group" not in out.columns:
-        rename_map["industry_category"] = "group"
-
-    if "industry" in out.columns and "group" not in out.columns:
-        rename_map["industry"] = "group"
-
-    if rename_map:
-        out = out.rename(columns=rename_map)
-
-    if "name" not in out.columns:
-        out["name"] = ""
-    if "group" not in out.columns:
-        out["group"] = ""
-    if "stock_id" not in out.columns:
-        raise ValueError("TaiwanStockInfo 缺少 stock_id 欄位")
-
-    out["stock_id"] = out["stock_id"].astype(str)
-    out["name"] = out["name"].astype(str)
-    out["group"] = out["group"].fillna("").astype(str)
+    out["near_support"] = out["near_support"].round(2)
+    out["strong_support"] = out["strong_support"].round(2)
+    out["near_resistance"] = out["near_resistance"].round(2)
+    out["strong_resistance"] = out["strong_resistance"].round(2)
 
     return out
 
 
-def fetch_stock_universe() -> pd.DataFrame:
-    # 你的 finmind_get 需要 dataset, data_id, start_date 三個參數
-    # TaiwanStockInfo 雖然實際上不太用 data_id / start_date，但為了符合函式簽名必須傳
-    info_df = finmind_get("TaiwanStockInfo", "2330", "2024-01-01")
-    if info_df.empty:
-        raise RuntimeError("抓不到 TaiwanStockInfo")
+def _first_filter_with_fallback(raw_df: pd.DataFrame, progress_callback: ProgressCallback) -> pd.DataFrame:
+    df = raw_df.copy()
 
-    info_df = _normalize_stock_info_df(info_df)
-
-    info_df = info_df[info_df["stock_id"].str.match(r"^\d{4}$", na=False)].copy()
-
-    # 最前面先排除 ETF / 金融
-    info_df["is_excluded"] = info_df.apply(
-        lambda x: _is_excluded_stock(
-            stock_id=str(x["stock_id"]),
-            name=str(x["name"]),
-            group=str(x["group"]),
-        ),
-        axis=1,
+    _update_progress(
+        progress_callback,
+        {
+            "scan_running": True,
+            "stage": "filter",
+            "percent": 90,
+            "message": f"進入第一層快篩，原始候選 {len(df)} 檔",
+        },
     )
 
-    info_df = info_df[~info_df["is_excluded"]].copy()
-    info_df = info_df.reset_index(drop=True)
-
-    return info_df[["stock_id", "name", "group"]]
-
-
-def fetch_market_snapshot_parallel(progress_callback=None) -> pd.DataFrame:
-    universe_df = fetch_stock_universe()
-    total = len(universe_df)
-
-    if total == 0:
-        return pd.DataFrame()
-
-    start_date = (date.today() - timedelta(days=PRICE_LOOKBACK_DAYS)).isoformat()
-
-    results: list[dict[str, Any]] = []
-    processed = 0
-    success = 0
-    failed = 0
-    skipped = 0
-
-    if progress_callback:
-        progress_callback(
-            {
-                "scan_running": True,
-                "stage": "fetch",
-                "percent": 0,
-                "message": "開始抓全市場資料",
-                "processed": 0,
-                "total": total,
-                "success": 0,
-                "failed": 0,
-                "skipped": 0,
-            }
+    # 第一層：正常偏嚴
+    f1 = df[
+        (df["close"] >= 10)
+        & (df["turnover_100m"] >= 1.0)
+        & (
+            ((df["volume_ratio"] >= 1.15) & (df["pct_from_ma20"] > -8))
+            | (df["turnover_100m"] >= 8.0)
         )
+    ].copy()
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_map = {
-            executor.submit(
-                _fetch_one_stock,
-                str(row.stock_id),
-                str(row.name),
-                str(row.group),
-                start_date,
-            ): str(row.stock_id)
-            for row in universe_df.itertuples(index=False)
-        }
+    _update_progress(
+        progress_callback,
+        {
+            "scan_running": True,
+            "stage": "filter",
+            "percent": 91,
+            "message": f"第一層快篩 A 後剩 {len(f1)} 檔",
+        },
+    )
 
-        for future in as_completed(future_map):
-            result = future.result()
-            results.append(result)
+    if len(f1) > 0:
+        return f1
 
-            processed += 1
+    # 第二層：放寬
+    f2 = df[
+        (df["close"] >= 8)
+        & (df["turnover_100m"] >= 0.5)
+        & (
+            ((df["volume_ratio"] >= 1.0) & (df["pct_from_ma20"] > -12))
+            | (df["turnover_100m"] >= 5.0)
+        )
+    ].copy()
 
-            reason = result.get("fetch_skipped_reason")
-            if reason is None:
-                success += 1
-            elif reason == "fetch_error":
-                failed += 1
-            else:
-                skipped += 1
+    _update_progress(
+        progress_callback,
+        {
+            "scan_running": True,
+            "stage": "filter",
+            "percent": 92,
+            "message": f"第一層快篩 B 後剩 {len(f2)} 檔",
+        },
+    )
 
-            if progress_callback:
-                percent = min(87, int(processed / total * 87))
-                progress_callback(
-                    {
-                        "scan_running": True,
-                        "stage": "fetch",
-                        "percent": percent,
-                        "message": "抓取全市場資料中",
-                        "processed": processed,
-                        "total": total,
-                        "success": success,
-                        "failed": failed,
-                        "skipped": skipped,
-                    }
-                )
+    if len(f2) > 0:
+        return f2
 
-    if not results:
-        return pd.DataFrame()
+    # 第三層：再放寬，至少不要整個炸掉
+    f3 = df[
+        (df["close"] >= 5)
+        & (
+            (df["turnover_100m"] >= 0.3)
+            | (df["volume_ratio"] >= 0.9)
+        )
+    ].copy()
 
-    df = pd.DataFrame(results)
+    _update_progress(
+        progress_callback,
+        {
+            "scan_running": True,
+            "stage": "filter",
+            "percent": 93,
+            "message": f"第一層快篩 C 後剩 {len(f3)} 檔",
+        },
+    )
 
-    # 只保留真正抓成功的
-    df = df[df["fetch_skipped_reason"].isna()].copy()
+    if len(f3) > 0:
+        return f3
 
-    if df.empty:
-        return pd.DataFrame()
+    # 最後保底：直接取成交值前 300 檔，不要讓整個掃描失敗
+    fallback = df.sort_values(["turnover_100m", "volume_ratio"], ascending=False).head(300).copy()
+
+    _update_progress(
+        progress_callback,
+        {
+            "scan_running": True,
+            "stage": "filter",
+            "percent": 94,
+            "message": f"快篩全空，改用成交值 fallback {len(fallback)} 檔",
+        },
+    )
+
+    return fallback
+
+
+def _classify_starting_second_wave(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    # 剛啟動：靠近 20 日高點 / 量比有放大 / 還沒離均線太遠 / MACD 轉強
+    starting_mask = (
+        (out["turnover_100m"] >= 0.8)
+        & (out["volume_ratio"] >= 1.1)
+        & (out["pct_from_ma20"] >= -3)
+        & (out["pct_from_ma20"] <= 18)
+        & (out["macd_hist"] >= -0.02)
+        & (out["close"] >= out["ma20"] * 0.98)
+        & (out["close"] >= out["platform_high_20d"] * 0.96)
+    )
+
+    # 第二波：第一波後整理，再轉強，但不要離月線太遠
+    second_wave_mask = (
+        (out["turnover_100m"] >= 0.8)
+        & (out["volume_ratio"] >= 0.95)
+        & (out["pct_from_ma20"] >= -4)
+        & (out["pct_from_ma20"] <= 25)
+        & (out["close"] >= out["ma20"] * 0.99)
+        & (out["close"] < out["platform_high_60d"] * 1.02)
+        & (out["close"] >= out["high_20d"] * 0.92)
+        & (
+            (out["rsi"] >= 52)
+            | (out["macd_hist"] > 0)
+            | (out["obv_trend"] > 0)
+        )
+    )
+
+    out["radar_tag"] = np.select(
+        [starting_mask, second_wave_mask],
+        ["剛啟動", "可能第二波"],
+        default="觀察",
+    )
+    out["tag"] = out["radar_tag"]
+
+    return out
+
+
+def _score_rows(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    # 法人分數：目前先用量價 / 趨勢強弱近似，等你之後接更完整法人資料再替換
+    out["institution_score"] = (
+        np.clip(out["turnover_100m"] * 2.5, 0, 40)
+        + np.clip((out["volume_ratio"] - 1) * 18, 0, 25)
+        + np.where(out["obv_trend"] > 0, 10, 0)
+    )
+
+    # 券商分數：先保留 0，等後面接分點資料
+    out["broker_score"] = 0.0
+
+    # 主力分數：技術結構 + 價格位置
+    out["main_force_score"] = (
+        np.where(out["close"] >= out["ma20"], 10, 0)
+        + np.where(out["close"] >= out["ma60"], 8, 0)
+        + np.where(out["macd_hist"] > 0, 10, 0)
+        + np.where((out["rsi"] >= 52) & (out["rsi"] <= 78), 10, 0)
+        + np.where(out["pct_from_ma20"].between(-2, 15), 12, 0)
+        + np.where(out["radar_tag"] == "剛啟動", 14, 0)
+        + np.where(out["radar_tag"] == "可能第二波", 16, 0)
+    )
+
+    out["score_total"] = (
+        out["institution_score"]
+        + out["broker_score"]
+        + out["main_force_score"]
+    ).round(1)
+
+    return out
+
+
+def _build_payload(selected_df: pd.DataFrame, raw_df: pd.DataFrame) -> dict[str, Any]:
+    selected_df = selected_df.copy()
+    raw_df = raw_df.copy()
+
+    top30 = (
+        selected_df.sort_values(["score_total", "turnover_100m"], ascending=False)
+        .head(30)
+        .to_dict(orient="records")
+    )
+
+    starting_df = selected_df[selected_df["radar_tag"] == "剛啟動"].copy()
+    second_wave_df = selected_df[selected_df["radar_tag"] == "可能第二波"].copy()
+
+    starting = (
+        starting_df.sort_values(["score_total", "turnover_100m"], ascending=False)
+        .head(30)
+        .to_dict(orient="records")
+    )
+
+    second_wave = (
+        second_wave_df.sort_values(["score_total", "turnover_100m"], ascending=False)
+        .head(30)
+        .to_dict(orient="records")
+    )
+
+    watchlist_df = (
+        selected_df.sort_values(["score_total", "turnover_100m"], ascending=False)
+        .head(20)
+        .copy()
+    )
+    watchlist = watchlist_df.to_dict(orient="records")
+
+    high_turnover = (
+        selected_df.sort_values(["turnover_100m", "score_total"], ascending=False)
+        .head(20)
+        .to_dict(orient="records")
+    )
+
+    overheated_df = selected_df[
+        (selected_df["rsi"] >= 82)
+        & (selected_df["pct_from_ma20"] >= 18)
+        & (selected_df["turnover_100m"] >= 3)
+    ].copy()
+
+    overheated = (
+        overheated_df.sort_values(["turnover_100m", "score_total"], ascending=False)
+        .head(20)
+        .to_dict(orient="records")
+    )
+
+    broker_track: list[dict[str, Any]] = []
+
+    payload = {
+        "summary": {
+            "market_scanned": int(len(raw_df)),
+            "selected": int(len(selected_df)),
+            "starting_count": int(len(starting_df)),
+            "second_wave_count": int(len(second_wave_df)),
+            "overheated_count": int(len(overheated_df)),
+        },
+        "top30": top30,
+        "watchlist": watchlist,
+        "starting": starting,
+        "second_wave": second_wave,
+        "broker_track": broker_track,
+        "overheated": overheated,
+        "high_turnover": high_turnover,
+        "all_selected": selected_df.to_dict(orient="records"),
+    }
+    return payload
+
+
+def run_scan(save: bool = True, progress_callback: ProgressCallback = None) -> dict[str, Any]:
+    _update_progress(
+        progress_callback,
+        {
+            "scan_running": True,
+            "stage": "fetch",
+            "percent": 0,
+            "message": "開始掃描",
+            "processed": 0,
+            "total": 0,
+            "success": 0,
+            "failed": 0,
+            "skipped": 0,
+            "last_scan_error": None,
+        },
+    )
+
+    raw_df = fetch_market_snapshot_parallel(progress_callback=progress_callback)
+
+    if raw_df.empty:
+        raise ValueError("抓完市場資料後是空的")
+
+    raw_df = raw_df.copy()
 
     numeric_cols = [
         "close",
@@ -435,9 +519,113 @@ def fetch_market_snapshot_parallel(progress_callback=None) -> pd.DataFrame:
         "high_5d",
         "high_20d",
     ]
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    raw_df = _clean_numeric(raw_df, numeric_cols)
 
-    df = df.sort_values(["turnover_100m", "volume_ratio"], ascending=False).reset_index(drop=True)
-    return df
+    if "trade_warning" not in raw_df.columns:
+        raw_df["trade_warning"] = ""
+    if "is_restricted" not in raw_df.columns:
+        raw_df["is_restricted"] = False
+
+    raw_df["theme"] = raw_df.apply(_assign_theme, axis=1)
+    raw_df = _compute_support_resistance(raw_df)
+
+    filtered_df = _first_filter_with_fallback(raw_df, progress_callback)
+
+    if filtered_df.empty:
+        # 這裡理論上不會發生，因為前面已有 fallback
+        filtered_df = raw_df.sort_values(["turnover_100m"], ascending=False).head(100).copy()
+
+    _update_progress(
+        progress_callback,
+        {
+            "scan_running": True,
+            "stage": "classify",
+            "percent": 95,
+            "message": f"開始分類剛啟動 / 第二波，候選 {len(filtered_df)} 檔",
+        },
+    )
+
+    classified_df = _classify_starting_second_wave(filtered_df)
+    selected_df = classified_df[classified_df["radar_tag"].isin(["剛啟動", "可能第二波"])].copy()
+
+    if selected_df.empty:
+        # 保底：用成交值前 60 檔，再用較寬鬆規則指定分類
+        fallback_df = filtered_df.sort_values(["turnover_100m", "volume_ratio"], ascending=False).head(60).copy()
+        fallback_df["radar_tag"] = np.where(
+            fallback_df["pct_from_ma20"] <= 8,
+            "剛啟動",
+            "可能第二波",
+        )
+        fallback_df["tag"] = fallback_df["radar_tag"]
+        selected_df = fallback_df.copy()
+
+        _update_progress(
+            progress_callback,
+            {
+                "scan_running": True,
+                "stage": "classify",
+                "percent": 96,
+                "message": f"原分類為空，啟用保底分類 {len(selected_df)} 檔",
+            },
+        )
+
+    selected_df = _score_rows(selected_df)
+
+    # 重新排序
+    selected_df = selected_df.sort_values(
+        ["score_total", "turnover_100m", "volume_ratio"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+    # 統一補齊欄位，避免前端缺欄位
+    required_cols_with_defaults: dict[str, Any] = {
+        "stock_id": "",
+        "name": "",
+        "group": "",
+        "theme": "其他",
+        "close": 0.0,
+        "change_pct": 0.0,
+        "volume": 0.0,
+        "turnover_100m": 0.0,
+        "volume_ratio": 0.0,
+        "institution_score": 0.0,
+        "broker_score": 0.0,
+        "main_force_score": 0.0,
+        "score_total": 0.0,
+        "radar_tag": "觀察",
+        "tag": "觀察",
+        "near_support": 0.0,
+        "strong_support": 0.0,
+        "near_resistance": 0.0,
+        "strong_resistance": 0.0,
+        "trade_warning": "",
+        "is_restricted": False,
+    }
+    for col, default_value in required_cols_with_defaults.items():
+        if col not in selected_df.columns:
+            selected_df[col] = default_value
+        if col not in raw_df.columns:
+            raw_df[col] = default_value
+
+    payload = _build_payload(selected_df, raw_df)
+
+    if save:
+        save_snapshot(payload=payload, raw_df=raw_df, selected_df=selected_df)
+
+    _update_progress(
+        progress_callback,
+        {
+            "scan_running": False,
+            "stage": "completed",
+            "percent": 100,
+            "message": f"掃描完成，入選 {len(selected_df)} 檔",
+            "processed": int(len(raw_df)),
+            "total": int(len(raw_df)),
+            "success": int(len(raw_df)),
+            "failed": 0,
+            "skipped": 0,
+            "last_scan_error": None,
+        },
+    )
+
+    return payload
