@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import gc
 import re
+
 import numpy as np
 import pandas as pd
 
@@ -61,6 +63,9 @@ EXCLUDED_GROUP_KEYWORDS = [
     "金控",
 ]
 
+EXCLUDED_NAME_PATTERN = "|".join(re.escape(keyword.upper()) for keyword in EXCLUDED_NAME_KEYWORDS)
+EXCLUDED_GROUP_PATTERN = "|".join(re.escape(keyword) for keyword in EXCLUDED_GROUP_KEYWORDS)
+
 # =========================
 # 細題材 mapping
 # 判斷順序：
@@ -69,158 +74,122 @@ EXCLUDED_GROUP_KEYWORDS = [
 # 3. 產業 group fallback
 # =========================
 STOCK_THEME_OVERRIDES: dict[str, str] = {
-    # =====================
     # CPO / 矽光子 / 光通訊
-    # =====================
-    "4979": "CPO/矽光子",   # 華星光
-    "4971": "CPO/矽光子",   # IET-KY
-    "4977": "CPO/矽光子",   # 眾達-KY
-    "3363": "CPO/矽光子",   # 上詮
-    "3163": "CPO/矽光子",   # 波若威
-    "3081": "CPO/矽光子",   # 聯亞
-    "3450": "CPO/矽光子",   # 聯鈞
-    "6442": "CPO/矽光子",   # 光聖
-    "3234": "CPO/矽光子",   # 光環
+    "4979": "CPO/矽光子",
+    "4971": "CPO/矽光子",
+    "4977": "CPO/矽光子",
+    "3363": "CPO/矽光子",
+    "3163": "CPO/矽光子",
+    "3081": "CPO/矽光子",
+    "3450": "CPO/矽光子",
+    "6442": "CPO/矽光子",
+    "3234": "CPO/矽光子",
     "4908": "光通訊",
-    "2345": "光通訊",
+    "2345": "網通",
 
-    # =====================
     # AI 伺服器 / BMC / ODM
-    # =====================
-    "5274": "AI伺服器/BMC",  # 信驊
-    "6669": "AI伺服器/OEM",  # 緯穎
-    "3231": "AI伺服器/OEM",  # 緯創
-    "2382": "AI伺服器/OEM",  # 廣達
-    "2357": "AI伺服器/OEM",  # 華碩
-    "4938": "AI伺服器/OEM",  # 和碩
-    "3017": "AI伺服器/OEM",  # 奇鋐其實更偏散熱，但常跟AI伺服器連動
+    "5274": "AI伺服器/BMC",
     "6669": "AI伺服器/OEM",
+    "3231": "AI伺服器/OEM",
+    "2382": "AI伺服器/OEM",
+    "2357": "AI伺服器/OEM",
+    "4938": "AI伺服器/OEM",
 
-    # =====================
     # 散熱
-    # =====================
-    "3017": "散熱",          # 奇鋐
-    "3324": "散熱",          # 雙鴻
-    "3653": "散熱",          # 健策
-    "2421": "散熱",          # 建準
+    "3017": "散熱",
+    "3324": "散熱",
+    "3653": "散熱",
+    "2421": "散熱",
     "2241": "散熱",
 
-    # =====================
     # BBU / 電池備援 / 電源
-    # =====================
-    "4931": "BBU/電池備援",  # 新盛力
-    "3211": "BBU/電池備援",  # 順達
-    "6781": "BBU/電池備援",  # AES-KY
-    "2308": "電源/UPS",      # 台達電
-    "2301": "電源/UPS",      # 光寶科
+    "4931": "BBU/電池備援",
+    "3211": "BBU/電池備援",
+    "6781": "BBU/電池備援",
+    "2308": "電源/UPS",
+    "2301": "電源/UPS",
     "8043": "電源/UPS",
     "6409": "電源/UPS",
 
-    # =====================
     # 低軌衛星 / 網通
-    # =====================
-    "3491": "低軌衛星",      # 昇達科
-    "2314": "低軌衛星",      # 台揚
-    "3596": "網通",          # 智易
-    "6285": "網通",          # 啟碁
-    "5388": "網通",          # 中磊
-    "4906": "網通",          # 正文
-    "2345": "網通",
+    "3491": "低軌衛星",
+    "2314": "低軌衛星",
+    "3596": "網通",
+    "6285": "網通",
+    "5388": "網通",
+    "4906": "網通",
 
-    # =====================
     # PCB / CCL / 載板
-    # =====================
-    "6274": "PCB/CCL",       # 台燿
-    "2383": "PCB/CCL",       # 台光電
-    "6672": "PCB/CCL",       # 騰輝電子-KY
-    "2368": "PCB/CCL",       # 金像電
-    "5469": "PCB/CCL",       # 瀚宇博
-    "3037": "PCB/CCL",       # 欣興較偏載板，但也可歸PCB體系
-    "8046": "ABF載板",       # 南電
-    "3189": "ABF載板",       # 景碩
-    "3037": "ABF載板",       # 欣興
+    "6274": "PCB/CCL",
+    "2383": "PCB/CCL",
+    "6672": "PCB/CCL",
+    "2368": "PCB/CCL",
+    "5469": "PCB/CCL",
+    "8046": "ABF載板",
+    "3189": "ABF載板",
+    "3037": "ABF載板",
 
-    # =====================
     # 記憶體
-    # =====================
-    "8299": "記憶體",        # 群聯
-    "2408": "記憶體",        # 南亞科
-    "2344": "記憶體",        # 華邦電
-    "4967": "記憶體",        # 十銓
-    "3260": "記憶體",        # 威剛
-    "2451": "記憶體",        # 創見
+    "8299": "記憶體",
+    "2408": "記憶體",
+    "2344": "記憶體",
+    "4967": "記憶體",
+    "3260": "記憶體",
+    "2451": "記憶體",
 
-    # =====================
     # 面板 / 觸控
-    # =====================
-    "3673": "面板/觸控",     # TPK-KY
-    "3481": "面板/觸控",     # 群創
-    "2409": "面板/觸控",     # 友達
+    "3673": "面板/觸控",
+    "3481": "面板/觸控",
+    "2409": "面板/觸控",
     "4976": "面板/觸控",
 
-    # =====================
     # MLCC / 被動元件
-    # =====================
-    "2327": "MLCC/被動元件", # 國巨
-    "2492": "MLCC/被動元件", # 華新科
-    "3026": "MLCC/被動元件", # 禾伸堂
-    "6173": "MLCC/被動元件", # 信昌電
+    "2327": "MLCC/被動元件",
+    "2492": "MLCC/被動元件",
+    "3026": "MLCC/被動元件",
+    "6173": "MLCC/被動元件",
     "6284": "MLCC/被動元件",
 
-    # =====================
     # 半導體設備 / 測試
-    # =====================
-    "2360": "半導體設備/測試", # 致茂
-    "3583": "半導體設備/測試", # 辛耘
-    "3131": "半導體設備/測試", # 弘塑
-    "6640": "半導體設備/測試", # 均華
-    "3413": "半導體設備/測試", # 京鼎
+    "2360": "半導體設備/測試",
+    "3583": "半導體設備/測試",
+    "3131": "半導體設備/測試",
+    "6640": "半導體設備/測試",
+    "3413": "半導體設備/測試",
     "5536": "半導體設備/測試",
     "6217": "半導體設備/測試",
 
-    # =====================
     # 銅箔 / 金屬材料
-    # =====================
-    "1785": "銅箔/材料",     # 光洋科
+    "1785": "銅箔/材料",
     "2031": "銅箔/材料",
     "2009": "銅箔/材料",
     "9958": "銅箔/材料",
 
-    # =====================
     # 軸承 / 傳動元件
-    # =====================
-    "4562": "軸承/傳動元件",  # 穎漢?
-    "4577": "軸承/傳動元件",  # 達航? 用你先前常問的個股納入
+    "4562": "軸承/傳動元件",
+    "4577": "軸承/傳動元件",
     "3376": "軸承/傳動元件",
     "1597": "軸承/傳動元件",
 
-    # =====================
     # 工業電腦
-    # =====================
     "2395": "工業電腦",
     "2468": "工業電腦",
     "3022": "工業電腦",
     "6166": "工業電腦",
 
-    # =====================
     # 軍工 / 航太
-    # =====================
     "2634": "軍工/航太",
     "4572": "軍工/航太",
     "8033": "軍工/航太",
     "2208": "軍工/航太",
 
-    # =====================
     # 生技
-    # =====================
     "4743": "生技",
     "6589": "生技",
     "1795": "生技",
     "6472": "生技",
 
-    # =====================
     # 重電 / 電網
-    # =====================
     "1519": "重電/電網",
     "1503": "重電/電網",
     "1513": "重電/電網",
@@ -235,18 +204,8 @@ THEME_KEYWORD_RULES: list[tuple[str, list[str]]] = [
             "光聖", "光環", "CPO", "矽光子", "共同封裝光學", "光模組", "高速光通訊"
         ],
     ),
-    (
-        "光通訊",
-        [
-            "光通訊", "光纖", "收發模組", "光纖模組", "光器件"
-        ],
-    ),
-    (
-        "AI伺服器/BMC",
-        [
-            "信驊", "BMC", "伺服器管理晶片", "AST2600", "AST2700"
-        ],
-    ),
+    ("光通訊", ["光通訊", "光纖", "收發模組", "光纖模組", "光器件"]),
+    ("AI伺服器/BMC", ["信驊", "BMC", "伺服器管理晶片", "AST2600", "AST2700"]),
     (
         "AI伺服器/OEM",
         [
@@ -254,111 +213,23 @@ THEME_KEYWORD_RULES: list[tuple[str, list[str]]] = [
             "AI伺服器", "資料中心", "GPU伺服器"
         ],
     ),
-    (
-        "散熱",
-        [
-            "奇鋐", "雙鴻", "健策", "建準", "散熱", "熱導管", "均熱片", "風扇", "散熱模組"
-        ],
-    ),
-    (
-        "BBU/電池備援",
-        [
-            "新盛力", "順達", "AES", "AES-KY", "BBU", "電池備援", "備援電池", "鋰電池模組"
-        ],
-    ),
-    (
-        "電源/UPS",
-        [
-            "台達電", "光寶科", "群電", "電源供應器", "UPS", "不斷電", "電源模組"
-        ],
-    ),
-    (
-        "低軌衛星",
-        [
-            "昇達科", "台揚", "低軌", "衛星", "LEO", "衛星通訊", "天線"
-        ],
-    ),
-    (
-        "網通",
-        [
-            "智易", "啟碁", "中磊", "正文", "網通", "交換器", "路由器", "乙太網路", "WiFi"
-        ],
-    ),
-    (
-        "PCB/CCL",
-        [
-            "台燿", "台光電", "騰輝", "騰輝電子", "金像電", "瀚宇博", "高技",
-            "PCB", "CCL", "銅箔基板", "印刷電路板"
-        ],
-    ),
-    (
-        "ABF載板",
-        [
-            "欣興", "景碩", "南電", "ABF", "載板", "IC載板"
-        ],
-    ),
-    (
-        "記憶體",
-        [
-            "群聯", "南亞科", "華邦電", "威剛", "創見", "十銓",
-            "記憶體", "DRAM", "NAND", "NOR", "SSD控制晶片"
-        ],
-    ),
-    (
-        "面板/觸控",
-        [
-            "TPK", "TPK-KY", "群創", "友達", "面板", "觸控", "觸控模組", "顯示面板"
-        ],
-    ),
-    (
-        "MLCC/被動元件",
-        [
-            "國巨", "華新科", "禾伸堂", "信昌電", "MLCC", "被動元件", "電容", "電感", "電阻"
-        ],
-    ),
-    (
-        "半導體設備/測試",
-        [
-            "致茂", "辛耘", "弘塑", "均華", "京鼎", "測試", "ATE", "探針卡", "晶圓設備",
-            "半導體設備", "封測設備"
-        ],
-    ),
-    (
-        "銅箔/材料",
-        [
-            "光洋科", "銅箔", "材料", "金屬材料", "濺鍍靶材", "靶材"
-        ],
-    ),
-    (
-        "軸承/傳動元件",
-        [
-            "軸承", "傳動", "線性滑軌", "滾珠螺桿", "傳動元件"
-        ],
-    ),
-    (
-        "工業電腦",
-        [
-            "研華", "凌華", "振樺電", "飛捷", "工業電腦", "IPC"
-        ],
-    ),
-    (
-        "軍工/航太",
-        [
-            "軍工", "航太", "雷虎", "漢翔", "長榮航太", "軍用", "無人機"
-        ],
-    ),
-    (
-        "生技",
-        [
-            "生技", "新藥", "醫材", "疫苗", "藥華藥", "保瑞"
-        ],
-    ),
-    (
-        "重電/電網",
-        [
-            "重電", "電網", "華城", "士電", "中興電", "亞力", "變壓器"
-        ],
-    ),
+    ("散熱", ["奇鋐", "雙鴻", "健策", "建準", "散熱", "熱導管", "均熱片", "風扇", "散熱模組"]),
+    ("BBU/電池備援", ["新盛力", "順達", "AES", "AES-KY", "BBU", "電池備援", "備援電池", "鋰電池模組"]),
+    ("電源/UPS", ["台達電", "光寶科", "群電", "電源供應器", "UPS", "不斷電", "電源模組"]),
+    ("低軌衛星", ["昇達科", "台揚", "低軌", "衛星", "LEO", "衛星通訊", "天線"]),
+    ("網通", ["智易", "啟碁", "中磊", "正文", "網通", "交換器", "路由器", "乙太網路", "WiFi"]),
+    ("PCB/CCL", ["台燿", "台光電", "騰輝", "騰輝電子", "金像電", "瀚宇博", "高技", "PCB", "CCL", "銅箔基板", "印刷電路板"]),
+    ("ABF載板", ["欣興", "景碩", "南電", "ABF", "載板", "IC載板"]),
+    ("記憶體", ["群聯", "南亞科", "華邦電", "威剛", "創見", "十銓", "記憶體", "DRAM", "NAND", "NOR", "SSD控制晶片"]),
+    ("面板/觸控", ["TPK", "TPK-KY", "群創", "友達", "面板", "觸控", "觸控模組", "顯示面板"]),
+    ("MLCC/被動元件", ["國巨", "華新科", "禾伸堂", "信昌電", "MLCC", "被動元件", "電容", "電感", "電阻"]),
+    ("半導體設備/測試", ["致茂", "辛耘", "弘塑", "均華", "京鼎", "測試", "ATE", "探針卡", "晶圓設備", "半導體設備", "封測設備"]),
+    ("銅箔/材料", ["光洋科", "銅箔", "材料", "金屬材料", "濺鍍靶材", "靶材"]),
+    ("軸承/傳動元件", ["軸承", "傳動", "線性滑軌", "滾珠螺桿", "傳動元件"]),
+    ("工業電腦", ["研華", "凌華", "振樺電", "飛捷", "工業電腦", "IPC"]),
+    ("軍工/航太", ["軍工", "航太", "雷虎", "漢翔", "長榮航太", "軍用", "無人機"]),
+    ("生技", ["生技", "新藥", "醫材", "疫苗", "藥華藥", "保瑞"]),
+    ("重電/電網", ["重電", "電網", "華城", "士電", "中興電", "亞力", "變壓器"]),
 ]
 
 INDUSTRY_FALLBACK_RULES: list[tuple[str, list[str]]] = [
@@ -437,6 +308,152 @@ NUMERIC_DEFAULTS: dict[str, float] = {
     "near_high20_ratio": 0.0,
 }
 
+RAW_SNAPSHOT_COLUMNS = [
+    "stock_id",
+    "name",
+    "group",
+    "close",
+    "turnover_100m",
+    "volume_ratio",
+    "volume_avg20",
+    "ma20",
+    "ma60",
+]
+
+SELECTED_SNAPSHOT_COLUMNS = [
+    "stock_id",
+    "name",
+    "group",
+    "theme",
+    "close",
+    "turnover_100m",
+    "volume_ratio",
+    "rsi",
+    "ma20",
+    "ma60",
+    "score_total",
+    "overall_priority_score",
+    "radar_tag",
+    "radar_tag_main",
+    "radar_tag_sub",
+    "institution_score",
+    "main_force_score",
+    "broker_score",
+    "breakout_score",
+    "revenue_score",
+    "near_support",
+    "strong_support",
+    "near_resistance",
+    "strong_resistance",
+]
+
+TABLE_EXPORT_COLUMNS = [
+    "stock_id",
+    "name",
+    "group",
+    "theme",
+    "close",
+    "turnover_100m",
+    "volume_ratio",
+    "volume_avg20",
+    "rsi",
+    "ma20",
+    "ma60",
+    "platform_high_20d",
+    "platform_high_60d",
+    "near_high20_ratio",
+    "pct_from_ma20",
+    "vol5_over_vol20",
+    "institution_score",
+    "main_force_score",
+    "broker_score",
+    "breakout_score",
+    "revenue_score",
+    "tech_score",
+    "score_total",
+    "overall_priority_score",
+    "score_starting",
+    "score_second_wave",
+    "score_strong_trend",
+    "starting_breakout_score",
+    "starting_accum_score",
+    "second_wave_score",
+    "strong_trend_score",
+    "radar_tag",
+    "radar_tag_main",
+    "radar_tag_sub",
+    "foreign_buy_days",
+    "investment_buy_days",
+    "dealer_buy_days",
+    "foreign_buy",
+    "trust_buy",
+    "dealer_buy",
+    "trust_holding_pct",
+    "estimated_inst_cost",
+    "main_force_10d",
+    "broker_buy_5d",
+    "revenue_yoy",
+    "revenue_mom",
+    "institution_force",
+    "trust_force",
+    "near_support",
+    "strong_support",
+    "near_resistance",
+    "strong_resistance",
+    "trade_warning",
+    "is_restricted",
+]
+
+EXTERNAL_ZERO_COLUMNS = [
+    "foreign_buy_days",
+    "investment_buy_days",
+    "dealer_buy_days",
+    "foreign_buy",
+    "trust_buy",
+    "dealer_buy",
+    "trust_holding_pct",
+    "estimated_inst_cost",
+    "main_force_10d",
+    "broker_buy_5d",
+    "revenue_yoy",
+    "revenue_mom",
+]
+
+SCORE_NUMERIC_COLUMNS = [
+    *EXTERNAL_ZERO_COLUMNS,
+    "institution_force",
+    "trust_force",
+]
+
+SCORE_OUTPUT_COLUMNS = [
+    "institution_score",
+    "main_force_score",
+    "broker_score",
+    "breakout_score",
+    "revenue_score",
+    "tech_score",
+    "score_total",
+    "starting_breakout_score",
+    "starting_accum_score",
+    "second_wave_score",
+    "strong_trend_score",
+    "score_starting",
+    "score_second_wave",
+    "score_strong_trend",
+    "overall_priority_score",
+]
+
+BOOL_COLUMNS = [
+    "is_above_ma20",
+    "is_above_ma60",
+    "is_near_breakout",
+    "is_strong_near_high",
+    "is_macd_positive",
+    "is_macd_hist_positive",
+    "is_excluded",
+    "is_restricted",
+]
+
 
 def log_count(label: str, df: pd.DataFrame) -> None:
     print(f"[SCAN] {label}: {len(df)}")
@@ -447,6 +464,33 @@ def normalize_text(value: str) -> str:
     text = text.replace("－", "-").replace("—", "-").replace("–", "-")
     text = re.sub(r"[\s_/()（）．.]+", "", text)
     return text
+
+
+def downcast_numeric_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    for col in columns:
+        if col not in df.columns:
+            continue
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        if pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = pd.to_numeric(df[col], downcast="float")
+    return df
+
+
+def shrink_dataframe_memory(df: pd.DataFrame) -> pd.DataFrame:
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    bool_cols = df.select_dtypes(include=["bool"]).columns.tolist()
+
+    if numeric_cols:
+        df = downcast_numeric_columns(df, numeric_cols)
+
+    for col in bool_cols:
+        df[col] = df[col].astype(bool)
+
+    for col in ("stock_id", "name", "group", "theme", "radar_tag", "radar_tag_main", "radar_tag_sub", "tag", "trade_warning"):
+        if col in df.columns:
+            df[col] = df[col].astype("string")
+
+    return df
 
 
 def ensure_market_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -472,7 +516,7 @@ def ensure_market_columns(df: pd.DataFrame) -> pd.DataFrame:
             .fillna(default)
         )
 
-    return out
+    return downcast_numeric_columns(out, list(NUMERIC_DEFAULTS.keys()))
 
 
 def derive_pattern_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -520,7 +564,7 @@ def derive_pattern_features(df: pd.DataFrame) -> pd.DataFrame:
     out["is_macd_positive"] = out["macd"] > out["macd_signal"]
     out["is_macd_hist_positive"] = out["macd_hist"] > 0
 
-    return out
+    return shrink_dataframe_memory(out)
 
 
 def is_excluded_stock(name: str, group: str) -> bool:
@@ -559,30 +603,34 @@ def classify_theme(stock_id: str, name: str, group: str) -> str:
 
 def add_exclusion_flag(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    out["is_excluded"] = out.apply(
-        lambda x: is_excluded_stock(str(x["name"]), str(x["group"])),
-        axis=1,
-    )
+
+    name_series = out["name"].fillna("").astype(str).str.upper()
+    group_series = out["group"].fillna("").astype(str)
+
+    name_mask = name_series.str.contains(EXCLUDED_NAME_PATTERN, regex=True, na=False)
+    group_mask = group_series.str.contains(EXCLUDED_GROUP_PATTERN, regex=True, na=False)
+
+    out["is_excluded"] = name_mask | group_mask
     return out
 
 
 def sort_stage1_candidates(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+    if df.empty:
+        return df
 
-    if out.empty:
-        return out
-
-    out["sort_turnover"] = pd.to_numeric(out["turnover_100m"], errors="coerce").fillna(0)
-    out["sort_volume_ratio"] = pd.to_numeric(out["volume_ratio"], errors="coerce").fillna(0)
-    out["sort_vol5_over_vol20"] = pd.to_numeric(out["vol5_over_vol20"], errors="coerce").fillna(0)
-    out["sort_near_high"] = pd.to_numeric(out["near_high20_ratio"], errors="coerce").fillna(0)
-    out["sort_trend_bonus"] = np.where(
-        (out["close"] > out["ma20"])
-        | (out["close"] > out["ma60"])
-        | (out["macd"] > out["macd_signal"])
-        | (out["obv_trend"] > 0),
-        1,
-        0,
+    out = df.assign(
+        sort_turnover=pd.to_numeric(df["turnover_100m"], errors="coerce").fillna(0),
+        sort_volume_ratio=pd.to_numeric(df["volume_ratio"], errors="coerce").fillna(0),
+        sort_vol5_over_vol20=pd.to_numeric(df["vol5_over_vol20"], errors="coerce").fillna(0),
+        sort_near_high=pd.to_numeric(df["near_high20_ratio"], errors="coerce").fillna(0),
+        sort_trend_bonus=np.where(
+            (df["close"] > df["ma20"])
+            | (df["close"] > df["ma60"])
+            | (df["macd"] > df["macd_signal"])
+            | (df["obv_trend"] > 0),
+            1,
+            0,
+        ),
     )
 
     out = out.sort_values(
@@ -594,7 +642,7 @@ def sort_stage1_candidates(df: pd.DataFrame) -> pd.DataFrame:
             "sort_vol5_over_vol20",
         ],
         ascending=False,
-    ).head(SECOND_SCAN_LIMIT).copy()
+    ).head(SECOND_SCAN_LIMIT)
 
     return out.drop(
         columns=[
@@ -604,7 +652,7 @@ def sort_stage1_candidates(df: pd.DataFrame) -> pd.DataFrame:
             "sort_near_high",
             "sort_trend_bonus",
         ]
-    )
+    ).copy()
 
 
 def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
@@ -614,6 +662,9 @@ def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
     log_count("Raw universe", out)
 
     universe = out.loc[~out["is_excluded"]].copy()
+    del out
+    gc.collect()
+
     log_count("After exclude ETF/financial", universe)
 
     universe = universe.loc[
@@ -666,8 +717,8 @@ def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
             (stage1_base["volume_ratio"] >= STARTING_BREAKOUT_MIN_VOLUME_RATIO)
             | (stage1_base["vol5_over_vol20"] >= STARTING_ACCUM_VOL5_OVER_VOL20_MIN)
             | (stage1_base["near_high20_ratio"] >= STARTING_ACCUM_NEAR_HIGH20_RATIO)
-            | (stage1_base["is_above_ma20"])
-            | (stage1_base["is_above_ma60"])
+            | stage1_base["is_above_ma20"]
+            | stage1_base["is_above_ma60"]
         )
     ].copy()
     log_count("Stage1 focus gate", stage1_focus)
@@ -725,38 +776,44 @@ def safe_merge_external(
     required_cols: list[str],
     source_name: str,
 ) -> pd.DataFrame:
-    out = base_df.copy()
-
     if ext_df.empty:
         print(f"[SCAN] {source_name} empty, fill zero")
+        out = base_df.copy()
+        for col in required_cols:
+            if col != "stock_id":
+                out[col] = 0.0
+        return out
+
+    if "stock_id" not in ext_df.columns:
+        print(f"[SCAN] {source_name} missing stock_id, fill zero")
+        out = base_df.copy()
         for col in required_cols:
             if col != "stock_id":
                 out[col] = 0.0
         return out
 
     ext = ext_df.copy()
-    if "stock_id" not in ext.columns:
-        print(f"[SCAN] {source_name} missing stock_id, fill zero")
-        for col in required_cols:
-            if col != "stock_id":
-                out[col] = 0.0
-        return out
-
     ext["stock_id"] = ext["stock_id"].astype(str)
+    ext = ext.drop_duplicates(subset=["stock_id"], keep="last")
 
+    keep_cols = ["stock_id"]
     for col in required_cols:
+        if col == "stock_id":
+            continue
         if col not in ext.columns:
             print(f"[SCAN] {source_name} missing col {col}, fill zero")
-            if col != "stock_id":
-                ext[col] = 0.0
+            ext[col] = 0.0
+        keep_cols.append(col)
 
-    out = out.merge(ext[required_cols], on="stock_id", how="left")
+    ext = ext[keep_cols]
+    out = base_df.merge(ext, on="stock_id", how="left", copy=False)
 
     for col in required_cols:
-        if col != "stock_id":
-            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+        if col == "stock_id":
+            continue
+        out[col] = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    return out
+    return downcast_numeric_columns(out, [col for col in required_cols if col != "stock_id"])
 
 
 def merge_external_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -786,6 +843,8 @@ def merge_external_data(df: pd.DataFrame) -> pd.DataFrame:
         ],
         INSTITUTIONAL_CSV,
     )
+    del institutional
+    gc.collect()
 
     print("[SCAN] Fetch broker data")
     broker = get_broker_data(stock_ids)
@@ -797,6 +856,8 @@ def merge_external_data(df: pd.DataFrame) -> pd.DataFrame:
         ["stock_id", "main_force_10d", "broker_buy_5d"],
         "broker",
     )
+    del broker
+    gc.collect()
 
     print("[SCAN] Fetch revenue data")
     revenue = get_revenue_data(stock_ids)
@@ -808,22 +869,10 @@ def merge_external_data(df: pd.DataFrame) -> pd.DataFrame:
         ["stock_id", "revenue_yoy", "revenue_mom"],
         REVENUE_CSV,
     )
+    del revenue
+    gc.collect()
 
-    fill_zero_cols = [
-        "foreign_buy_days",
-        "investment_buy_days",
-        "dealer_buy_days",
-        "foreign_buy",
-        "trust_buy",
-        "dealer_buy",
-        "trust_holding_pct",
-        "estimated_inst_cost",
-        "main_force_10d",
-        "broker_buy_5d",
-        "revenue_yoy",
-        "revenue_mom",
-    ]
-    for col in fill_zero_cols:
+    for col in EXTERNAL_ZERO_COLUMNS:
         if col not in out.columns:
             out[col] = 0.0
         out[col] = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -835,8 +884,10 @@ def merge_external_data(df: pd.DataFrame) -> pd.DataFrame:
     out["institution_force"] = out["institution_force"].replace([np.inf, -np.inf], 0).fillna(0)
     out["trust_force"] = out["trust_force"].replace([np.inf, -np.inf], 0).fillna(0)
 
+    out = downcast_numeric_columns(out, EXTERNAL_ZERO_COLUMNS + ["institution_force", "trust_force"])
+
     print("[SCAN] merge_external_data done")
-    return out
+    return shrink_dataframe_memory(out)
 
 
 def calc_institution_score(row: pd.Series) -> float:
@@ -973,40 +1024,38 @@ def calculate_support_resistance(df: pd.DataFrame) -> pd.DataFrame:
     out["near_resistance"] = np.round(out["high_5d"], 2)
     out["strong_resistance"] = np.round(np.maximum(out["high_20d"], out["high_5d"] * 1.03), 2)
 
-    return out
+    return downcast_numeric_columns(out, ["near_support", "strong_support", "near_resistance", "strong_resistance"])
 
 
 def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
-    out = derive_pattern_features(df)
+    out = df.copy()
 
-    for col in [
-        "foreign_buy_days",
-        "investment_buy_days",
-        "dealer_buy_days",
-        "foreign_buy",
-        "trust_buy",
-        "dealer_buy",
-        "trust_holding_pct",
-        "estimated_inst_cost",
-        "main_force_10d",
-        "broker_buy_5d",
-        "revenue_yoy",
-        "revenue_mom",
-        "institution_force",
-        "trust_force",
-    ]:
+    for col, default in NUMERIC_DEFAULTS.items():
+        if col not in out.columns:
+            out[col] = default
+
+    for col in SCORE_NUMERIC_COLUMNS:
         if col not in out.columns:
             out[col] = 0.0
         out[col] = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    out["theme"] = out.apply(
-        lambda x: classify_theme(
-            str(x["stock_id"]),
-            str(x["name"]),
-            str(x["group"]),
-        ),
-        axis=1,
-    )
+    if "is_above_ma20" not in out.columns:
+        out["is_above_ma20"] = out["close"] > out["ma20"]
+    if "is_above_ma60" not in out.columns:
+        out["is_above_ma60"] = out["close"] > out["ma60"]
+    if "is_near_breakout" not in out.columns:
+        out["is_near_breakout"] = out["near_high20_ratio"] >= STARTING_ACCUM_NEAR_HIGH20_RATIO
+    if "is_strong_near_high" not in out.columns:
+        out["is_strong_near_high"] = out["near_high20_ratio"] >= STRONG_TREND_NEAR_HIGH20_RATIO
+    if "is_macd_positive" not in out.columns:
+        out["is_macd_positive"] = out["macd"] > out["macd_signal"]
+    if "is_macd_hist_positive" not in out.columns:
+        out["is_macd_hist_positive"] = out["macd_hist"] > 0
+
+    out["theme"] = [
+        classify_theme(stock_id, name, group)
+        for stock_id, name, group in zip(out["stock_id"], out["name"], out["group"])
+    ]
     out["theme_priority"] = out["theme"].map(THEME_SORT_PRIORITY).fillna(999)
 
     out["institution_score"] = out.apply(calc_institution_score, axis=1)
@@ -1156,10 +1205,11 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
     if "is_restricted" not in out.columns:
         out["is_restricted"] = False
 
-    return out
+    out = downcast_numeric_columns(out, SCORE_OUTPUT_COLUMNS + ["theme_priority"])
+    return shrink_dataframe_memory(out)
 
 
-def build_reason_and_targets(row: pd.Series) -> dict:
+def build_reason_and_targets(row: dict) -> dict:
     reasons: list[str] = []
 
     main_tag = str(row.get("radar_tag_main") or "")
@@ -1176,52 +1226,50 @@ def build_reason_and_targets(row: pd.Series) -> dict:
     if theme and theme != "其他":
         reasons.append(f"細題材歸類：{theme}")
 
-    if row.get("institution_score", 0) >= 12:
+    if float(row.get("institution_score", 0) or 0) >= 12:
         reasons.append("法人籌碼加分明顯")
-    elif row.get("institution_score", 0) >= 6:
+    elif float(row.get("institution_score", 0) or 0) >= 6:
         reasons.append("法人買盤有延續")
 
-    if row.get("main_force_score", 0) >= 10:
+    if float(row.get("main_force_score", 0) or 0) >= 10:
         reasons.append("主力近10日累積明顯")
-    elif row.get("main_force_score", 0) >= 6:
+    elif float(row.get("main_force_score", 0) or 0) >= 6:
         reasons.append("主力有偏多痕跡")
 
-    if row.get("broker_score", 0) >= 8:
+    if float(row.get("broker_score", 0) or 0) >= 8:
         reasons.append("分點買盤偏強")
-    elif row.get("broker_score", 0) >= 5:
+    elif float(row.get("broker_score", 0) or 0) >= 5:
         reasons.append("分點有短線加分")
 
-    if row.get("revenue_score", 0) >= 10:
+    if float(row.get("revenue_score", 0) or 0) >= 10:
         reasons.append("營收成長動能強")
-    elif row.get("revenue_score", 0) >= 5:
+    elif float(row.get("revenue_score", 0) or 0) >= 5:
         reasons.append("營收成長具支撐")
 
-    if row.get("volume_ratio", 0) >= 2:
+    if float(row.get("volume_ratio", 0) or 0) >= 2:
         reasons.append("量比放大，資金關注提高")
-    elif row.get("volume_ratio", 0) >= 1.3:
+    elif float(row.get("volume_ratio", 0) or 0) >= 1.3:
         reasons.append("量能優於均值")
-    elif row.get("vol5_over_vol20", 0) >= STARTING_ACCUM_VOL5_OVER_VOL20_MIN:
+    elif float(row.get("vol5_over_vol20", 0) or 0) >= STARTING_ACCUM_VOL5_OVER_VOL20_MIN:
         reasons.append("5日均量高於20日均量，偏收籌墊高")
 
-    if row.get("close", 0) > row.get("platform_high_20d", 0) > 0:
+    if float(row.get("close", 0) or 0) > float(row.get("platform_high_20d", 0) or 0) > 0:
         reasons.append("突破短期平台高點")
-    if row.get("close", 0) > row.get("platform_high_60d", 0) > 0:
+    if float(row.get("close", 0) or 0) > float(row.get("platform_high_60d", 0) or 0) > 0:
         reasons.append("突破中期平台高點")
-    if row.get("close", 0) > row.get("ma20", 0) > 0:
+    if float(row.get("close", 0) or 0) > float(row.get("ma20", 0) or 0) > 0:
         reasons.append("站上 MA20")
-    if row.get("close", 0) > row.get("ma60", 0) > 0:
+    if float(row.get("close", 0) or 0) > float(row.get("ma60", 0) or 0) > 0:
         reasons.append("站上 MA60")
-    if row.get("macd", 0) > row.get("macd_signal", 0):
-        reasons.append("MACD 偏多")
-    if row.get("obv_trend", 0) > 0:
-        reasons.append("OBV 走升")
-    if row.get("near_high20_ratio", 0) >= STRONG_TREND_NEAR_HIGH20_RATIO:
+    if float(row.get("near_high20_ratio", 0) or 0) >= STRONG_TREND_NEAR_HIGH20_RATIO:
         reasons.append("股價貼近20日高點")
 
     short_reasons = reasons[:4]
     reason_text = "；".join(short_reasons) if short_reasons else "符合模型條件"
 
     return {
+        "score": float(row.get("score_total", 0) or 0),
+        "tag": str(row.get("radar_tag") or ""),
         "reason_text": reason_text,
         "reason_list": reasons[:8],
         "near_support": row.get("near_support"),
@@ -1235,27 +1283,24 @@ def build_table_rows(df: pd.DataFrame) -> list[dict]:
     if df.empty:
         return []
 
-    out = df.copy()
-    out["score"] = out["score_total"]
-    out["tag"] = out["radar_tag"]
-
-    records = dataframe_to_records(out)
+    export_cols = [col for col in TABLE_EXPORT_COLUMNS if col in df.columns]
+    slim_df = df[export_cols].copy()
+    records = dataframe_to_records(slim_df)
 
     for row in records:
-        extra = build_reason_and_targets(pd.Series(row))
-        row.update(extra)
+        row.update(build_reason_and_targets(row))
 
     return records
 
 
-def build_payload(raw_df: pd.DataFrame, analyzed_df: pd.DataFrame) -> dict:
-    top30_df = analyzed_df.head(TOP30_COUNT).copy()
-    watchlist_df = analyzed_df.iloc[TOP30_COUNT:TOP30_COUNT + WATCHLIST_COUNT].copy()
+def build_payload(market_scanned: int, analyzed_df: pd.DataFrame) -> dict:
+    top30_df = analyzed_df.head(TOP30_COUNT)
+    watchlist_df = analyzed_df.iloc[TOP30_COUNT:TOP30_COUNT + WATCHLIST_COUNT]
 
     starting_df = analyzed_df[analyzed_df["radar_tag_main"] == "剛啟動"].sort_values(
         ["score_starting", "overall_priority_score", "turnover_100m"],
         ascending=False,
-    ).head(TOP30_COUNT).copy()
+    ).head(TOP30_COUNT)
 
     starting_breakout_df = analyzed_df[
         (analyzed_df["radar_tag_main"] == "剛啟動")
@@ -1263,7 +1308,7 @@ def build_payload(raw_df: pd.DataFrame, analyzed_df: pd.DataFrame) -> dict:
     ].sort_values(
         ["starting_breakout_score", "overall_priority_score", "turnover_100m"],
         ascending=False,
-    ).head(TOP30_COUNT).copy()
+    ).head(TOP30_COUNT)
 
     starting_accum_df = analyzed_df[
         (analyzed_df["radar_tag_main"] == "剛啟動")
@@ -1271,52 +1316,52 @@ def build_payload(raw_df: pd.DataFrame, analyzed_df: pd.DataFrame) -> dict:
     ].sort_values(
         ["starting_accum_score", "overall_priority_score", "turnover_100m"],
         ascending=False,
-    ).head(TOP30_COUNT).copy()
+    ).head(TOP30_COUNT)
 
     second_wave_df = analyzed_df[analyzed_df["radar_tag_main"] == "可能第二波"].sort_values(
         ["second_wave_score", "overall_priority_score", "turnover_100m"],
         ascending=False,
-    ).head(TOP30_COUNT).copy()
+    ).head(TOP30_COUNT)
 
     strong_trend_df = analyzed_df[analyzed_df["radar_tag_main"] == "強者恆強"].sort_values(
         ["strong_trend_score", "overall_priority_score", "turnover_100m"],
         ascending=False,
-    ).head(TOP30_COUNT).copy()
+    ).head(TOP30_COUNT)
 
     broker_track_df = analyzed_df.sort_values(
         ["broker_score", "main_force_score", "overall_priority_score"],
         ascending=False,
-    ).head(BROKER_TRACK_COUNT).copy()
+    ).head(BROKER_TRACK_COUNT)
 
     risk_overheated_df = analyzed_df[
         (analyzed_df["volume_ratio"] >= 2.5) & (analyzed_df["rsi"] >= 82)
-    ].head(20).copy()
+    ].head(20)
 
     high_turnover_df = analyzed_df.sort_values(
         ["turnover_100m", "volume_ratio"],
         ascending=False,
-    ).head(20).copy()
+    ).head(20)
 
     all_selected_df = analyzed_df.sort_values(
         ["theme_priority", "overall_priority_score", "turnover_100m"],
         ascending=[True, False, False],
-    ).copy()
+    )
 
     payload = {
         "summary": {
-            "market_scanned": int(len(raw_df)),
+            "market_scanned": int(market_scanned),
             "selected": int(len(analyzed_df)),
-            "starting_count": int(len(analyzed_df[analyzed_df["radar_tag_main"] == "剛啟動"])),
-            "starting_breakout_count": int(len(analyzed_df[
+            "starting_count": int((analyzed_df["radar_tag_main"] == "剛啟動").sum()),
+            "starting_breakout_count": int((
                 (analyzed_df["radar_tag_main"] == "剛啟動")
                 & (analyzed_df["radar_tag_sub"] == "爆量突破")
-            ])),
-            "starting_accum_count": int(len(analyzed_df[
+            ).sum()),
+            "starting_accum_count": int((
                 (analyzed_df["radar_tag_main"] == "剛啟動")
                 & (analyzed_df["radar_tag_sub"] == "收籌墊高")
-            ])),
-            "second_wave_count": int(len(analyzed_df[analyzed_df["radar_tag_main"] == "可能第二波"])),
-            "strong_trend_count": int(len(analyzed_df[analyzed_df["radar_tag_main"] == "強者恆強"])),
+            ).sum()),
+            "second_wave_count": int((analyzed_df["radar_tag_main"] == "可能第二波").sum()),
+            "strong_trend_count": int((analyzed_df["radar_tag_main"] == "強者恆強").sum()),
             "overheated_count": int(len(risk_overheated_df)),
         },
         "top30": build_table_rows(top30_df),
@@ -1332,6 +1377,20 @@ def build_payload(raw_df: pd.DataFrame, analyzed_df: pd.DataFrame) -> dict:
         "all_selected": build_table_rows(all_selected_df),
     }
     return payload
+
+
+def make_snapshot_df(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    if df.empty:
+        return df.head(0).copy()
+
+    out = pd.DataFrame(index=df.index)
+    for col in columns:
+        if col in df.columns:
+            out[col] = df[col]
+        else:
+            out[col] = ""
+
+    return shrink_dataframe_memory(out.copy())
 
 
 def run_scan(save: bool = True, progress_callback=None) -> dict:
@@ -1356,6 +1415,9 @@ def run_scan(save: bool = True, progress_callback=None) -> dict:
     if raw_df.empty:
         raise RuntimeError("抓不到市場資料")
 
+    market_scanned = len(raw_df)
+    raw_snapshot_df = make_snapshot_df(raw_df, RAW_SNAPSHOT_COLUMNS) if save else pd.DataFrame()
+
     if progress_callback:
         progress_callback(
             {
@@ -1368,6 +1430,9 @@ def run_scan(save: bool = True, progress_callback=None) -> dict:
     print("[SCAN] Step 2: first stage filter")
     stage1_df = first_stage_filter(raw_df)
     print(f"[SCAN] First stage selected: {len(stage1_df)}")
+
+    del raw_df
+    gc.collect()
 
     if stage1_df.empty:
         raise RuntimeError("第一層快篩後沒有股票（請檢查欄位來源或門檻設定）")
@@ -1384,6 +1449,9 @@ def run_scan(save: bool = True, progress_callback=None) -> dict:
     print("[SCAN] Step 3: merge external data")
     stage2_input = merge_external_data(stage1_df)
     print(f"[SCAN] Stage2 rows: {len(stage2_input)}")
+
+    del stage1_df
+    gc.collect()
 
     if progress_callback:
         progress_callback(
@@ -1402,6 +1470,9 @@ def run_scan(save: bool = True, progress_callback=None) -> dict:
     ).reset_index(drop=True)
     print(f"[SCAN] Final analyzed rows: {len(analyzed_df)}")
 
+    del stage2_input
+    gc.collect()
+
     if analyzed_df.empty:
         raise RuntimeError("分數計算後沒有股票（請檢查 merge / score 欄位）")
 
@@ -1415,7 +1486,7 @@ def run_scan(save: bool = True, progress_callback=None) -> dict:
         )
 
     print("[SCAN] Step 5: build payload")
-    payload = build_payload(raw_df, analyzed_df)
+    payload = build_payload(market_scanned, analyzed_df)
 
     if save:
         if progress_callback:
@@ -1427,9 +1498,18 @@ def run_scan(save: bool = True, progress_callback=None) -> dict:
                 }
             )
 
+        selected_snapshot_df = make_snapshot_df(analyzed_df, SELECTED_SNAPSHOT_COLUMNS)
+
         print("[SCAN] Step 6: save snapshot")
-        save_snapshot(payload, raw_df, analyzed_df)
+        save_snapshot(payload, raw_snapshot_df, selected_snapshot_df)
         print("[SCAN] Snapshot saved")
+
+        del selected_snapshot_df
+        gc.collect()
+
+    del raw_snapshot_df
+    del analyzed_df
+    gc.collect()
 
     if progress_callback:
         progress_callback(
