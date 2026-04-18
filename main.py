@@ -245,6 +245,102 @@ def safe_str(value: Any) -> str | None:
     text = str(value).strip()
     return text if text else None
 
+def _calc_main_force_score_value(value: float | None) -> float | None:
+    if value is None:
+        return None
+    v = float(value)
+    if v >= 30000:
+        return 15.0
+    if v >= 15000:
+        return 10.0
+    if v >= 5000:
+        return 6.0
+    return 0.0
+
+
+def _calc_broker_score_value(value: float | None) -> float | None:
+    if value is None:
+        return None
+    v = float(value)
+    if v >= 10000:
+        return 12.0
+    if v >= 5000:
+        return 8.0
+    if v >= 2000:
+        return 5.0
+    return 0.0
+
+
+def _get_financial_statement_df(stock_id: str) -> pd.DataFrame:
+    start_date = (date.today() - timedelta(days=2200)).isoformat()
+    df = finmind_get("TaiwanStockFinancialStatements", stock_id, start_date)
+    if df.empty or "date" not in df.columns or "value" not in df.columns:
+        return pd.DataFrame()
+
+    out = df.copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out["value_num"] = pd.to_numeric(out["value"], errors="coerce")
+
+    if "type" not in out.columns:
+        out["type"] = ""
+    if "origin_name" not in out.columns:
+        out["origin_name"] = ""
+
+    out["type"] = out["type"].astype(str)
+    out["origin_name"] = out["origin_name"].astype(str)
+
+    out = out.dropna(subset=["date", "value_num"]).sort_values("date")
+    return out
+
+
+def _match_financial_value(
+    sub: pd.DataFrame,
+    *,
+    type_codes: list[str],
+    origin_keywords: list[str],
+) -> float | None:
+    if sub.empty:
+        return None
+
+    exact = sub[sub["type"].isin(type_codes)].copy()
+    if not exact.empty:
+        return safe_float(exact.iloc[0]["value_num"])
+
+    fuzzy = sub[
+        sub["origin_name"].apply(lambda x: any(keyword in str(x) for keyword in origin_keywords))
+    ].copy()
+    if not fuzzy.empty:
+        return safe_float(fuzzy.iloc[0]["value_num"])
+
+    return None
+
+
+def _quarter_label(ts: pd.Timestamp) -> str:
+    return f"{ts.year}Q{((ts.month - 1) // 3) + 1}"
+
+
+def _get_live_broker_df(stock_id: str) -> pd.DataFrame:
+    try:
+        return get_broker_data([stock_id])
+    except Exception:
+        return pd.DataFrame()
+
+
+def _enrich_overview_with_live_broker(overview: dict[str, Any], broker_df: pd.DataFrame) -> None:
+    if broker_df.empty:
+        return
+
+    net10_col = "net_10d" if "net_10d" in broker_df.columns else "net"
+    net5_col = "net_5d" if "net_5d" in broker_df.columns else "net"
+
+    net10 = pd.to_numeric(broker_df[net10_col], errors="coerce").fillna(0)
+    net5 = pd.to_numeric(broker_df[net5_col], errors="coerce").fillna(0)
+
+    main_force_10d = float(net10[net10 > 0].nlargest(5).sum())
+    broker_buy_5d = float(net5[net5 > 0].nlargest(3).sum())
+
+    overview["main_force_score"] = _calc_main_force_score_value(main_force_10d)
+    overview["broker_score"] = _calc_broker_score_value(broker_buy_5d)
 
 def find_stock_context(snapshot: dict[str, Any], stock_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
     stock_id = str(stock_id)
@@ -602,37 +698,39 @@ def get_revenues_list(stock_id: str) -> list[dict[str, Any]]:
 
 
 def get_eps_list(stock_id: str) -> list[dict[str, Any]]:
-    start_date = (date.today() - timedelta(days=1600)).isoformat()
-    df = finmind_get("TaiwanStockFinancialStatements", stock_id, start_date)
-    if df.empty or "type" not in df.columns or "value" not in df.columns or "date" not in df.columns:
+    df = _get_financial_statement_df(stock_id)
+    if df.empty:
         return []
 
     eps_df = df[
-        df["type"].astype(str).str.contains("基本每股盈餘|每股盈餘|EPS", regex=True, na=False)
+        (df["type"] == "EPS")
+        | df["origin_name"].apply(lambda x: "基本每股盈餘" in str(x) or "每股盈餘" in str(x))
     ].copy()
+
     if eps_df.empty:
         return []
 
-    eps_df["date"] = pd.to_datetime(eps_df["date"], errors="coerce")
-    eps_df["value_num"] = pd.to_numeric(eps_df["value"], errors="coerce")
-    eps_df = eps_df.dropna(subset=["date", "value_num"]).sort_values("date")
+    eps_df = (
+        eps_df.sort_values(["date"])
+        .drop_duplicates(subset=["date"], keep="first")
+        .copy()
+    )
 
     eps_df["yoy"] = eps_df["value_num"].pct_change(4) * 100
     eps_df["qoq"] = eps_df["value_num"].pct_change(1) * 100
 
     out: list[dict[str, Any]] = []
     for _, row in eps_df.tail(12).sort_values("date", ascending=False).iterrows():
-        quarter = f"{row['date'].year}Q{((row['date'].month - 1) // 3) + 1}"
+        ts = pd.Timestamp(row["date"])
         out.append(
             {
-                "quarter": quarter,
+                "quarter": _quarter_label(ts),
                 "eps": safe_float(row.get("value_num")),
                 "yoy": safe_float(row.get("yoy")),
                 "qoq": safe_float(row.get("qoq")),
             }
         )
     return out
-
 
 def get_dividends_list(stock_id: str) -> list[dict[str, Any]]:
     start_date = (date.today() - timedelta(days=2600)).isoformat()
@@ -665,28 +763,41 @@ def get_dividends_list(stock_id: str) -> list[dict[str, Any]]:
 
 
 def get_financials_list(stock_id: str) -> list[dict[str, Any]]:
-    start_date = (date.today() - timedelta(days=1600)).isoformat()
-    df = finmind_get("TaiwanStockFinancialStatements", stock_id, start_date)
-    if df.empty or "date" not in df.columns or "type" not in df.columns or "value" not in df.columns:
+    df = _get_financial_statement_df(stock_id)
+    if df.empty:
         return []
 
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["value_num"] = pd.to_numeric(df["value"], errors="coerce")
-    df = df.dropna(subset=["date"])
-
-    wanted_map = {
-        "營業收入": "revenue",
-        "營業毛利": "gross_profit",
-        "營業利益": "operating_income",
-        "本期淨利": "net_income",
-        "基本每股盈餘": "eps",
+    wanted_specs = {
+        "revenue": {
+            "type_codes": ["Revenue"],
+            "origin_keywords": ["營業收入", "收入"],
+        },
+        "gross_profit": {
+            "type_codes": ["GrossProfit"],
+            "origin_keywords": ["營業毛利", "毛利"],
+        },
+        "operating_income": {
+            "type_codes": ["OperatingIncome"],
+            "origin_keywords": ["營業利益", "營業利益（損失）", "營業利益（損失）淨額"],
+        },
+        "net_income": {
+            "type_codes": ["IncomeAfterTaxes"],
+            "origin_keywords": ["本期淨利", "本期稅後淨利", "本期淨利（淨損）"],
+        },
+        "eps": {
+            "type_codes": ["EPS"],
+            "origin_keywords": ["基本每股盈餘", "每股盈餘"],
+        },
     }
 
     out: list[dict[str, Any]] = []
+
     for d in sorted(df["date"].dropna().unique(), reverse=True)[:8]:
         sub = df[df["date"] == d].copy()
+        ts = pd.Timestamp(d)
+
         item: dict[str, Any] = {
-            "period": f"{pd.Timestamp(d).year}Q{((pd.Timestamp(d).month - 1) // 3) + 1}",
+            "period": _quarter_label(ts),
             "revenue": None,
             "gross_profit": None,
             "operating_income": None,
@@ -694,10 +805,12 @@ def get_financials_list(stock_id: str) -> list[dict[str, Any]]:
             "eps": None,
         }
 
-        for keyword, field in wanted_map.items():
-            match = sub[sub["type"].astype(str).str.contains(keyword, na=False)]
-            if not match.empty:
-                item[field] = safe_float(match.iloc[0]["value_num"])
+        for field, spec in wanted_specs.items():
+            item[field] = _match_financial_value(
+                sub,
+                type_codes=spec["type_codes"],
+                origin_keywords=spec["origin_keywords"],
+            )
 
         out.append(item)
 
@@ -735,11 +848,7 @@ def get_news_list(stock_id: str) -> list[dict[str, Any]]:
 
 
 def get_broker_branches_list(stock_id: str) -> list[dict[str, Any]]:
-    try:
-        df = get_broker_data([stock_id])
-    except Exception:
-        return []
-
+    df = _get_live_broker_df(stock_id)
     if df.empty:
         return []
 
@@ -755,7 +864,6 @@ def get_broker_branches_list(stock_id: str) -> list[dict[str, Any]]:
             }
         )
     return out
-
 
 @app.on_event("startup")
 def startup_event() -> None:
