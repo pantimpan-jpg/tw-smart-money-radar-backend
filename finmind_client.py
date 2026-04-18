@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,10 @@ from config import (
 
 SESSION = requests.Session()
 
+SPECIAL_BASE_URL = (
+    FINMIND_BASE_URL[:-5] if FINMIND_BASE_URL.endswith("/data") else FINMIND_BASE_URL
+)
+
 
 def _auth_headers() -> dict[str, str]:
     if not FINMIND_API_TOKEN:
@@ -29,13 +33,13 @@ def _auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {FINMIND_API_TOKEN}"}
 
 
-def _request_finmind(params: dict[str, Any]) -> list[dict[str, Any]]:
+def _request_json(url: str, params: dict[str, Any]) -> list[dict[str, Any]]:
     last_error: Exception | None = None
 
     for attempt in range(RETRY_TIMES + 1):
         try:
             response = SESSION.get(
-                FINMIND_BASE_URL,
+                url,
                 headers=_auth_headers(),
                 params=params,
                 timeout=REQUEST_TIMEOUT,
@@ -58,7 +62,16 @@ def _request_finmind(params: dict[str, Any]) -> list[dict[str, Any]]:
             if attempt < RETRY_TIMES:
                 time.sleep(0.8 * (attempt + 1))
 
-    raise RuntimeError(f"FinMind request failed: {params} | err={last_error}")
+    raise RuntimeError(f"FinMind request failed: url={url}, params={params} | err={last_error}")
+
+
+def _request_finmind_data(params: dict[str, Any]) -> list[dict[str, Any]]:
+    return _request_json(FINMIND_BASE_URL, params)
+
+
+def _request_finmind_special(path: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+    url = f"{SPECIAL_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
+    return _request_json(url, params)
 
 
 def finmind_get(
@@ -76,7 +89,7 @@ def finmind_get(
     if end_date not in (None, ""):
         params["end_date"] = end_date
 
-    data = _request_finmind(params)
+    data = _request_finmind_data(params)
     if not data:
         return pd.DataFrame()
 
@@ -170,9 +183,7 @@ def get_institutional_data(stock_ids: list[str]) -> pd.DataFrame:
                 "TaiwanStockInstitutionalInvestorsBuySell",
                 start_date=d,
             )
-            if daily.empty:
-                continue
-            if "stock_id" not in daily.columns:
+            if daily.empty or "stock_id" not in daily.columns:
                 continue
 
             daily["stock_id"] = daily["stock_id"].astype(str)
@@ -281,9 +292,7 @@ def get_revenue_data(stock_ids: list[str]) -> pd.DataFrame:
     for start in month_starts:
         try:
             monthly = finmind_get("TaiwanStockMonthRevenue", start_date=start)
-            if monthly.empty:
-                continue
-            if "stock_id" not in monthly.columns:
+            if monthly.empty or "stock_id" not in monthly.columns:
                 continue
 
             monthly["stock_id"] = monthly["stock_id"].astype(str)
@@ -336,26 +345,74 @@ def get_revenue_data(stock_ids: list[str]) -> pd.DataFrame:
     return latest[["stock_id", "revenue_yoy", "revenue_mom"]].reset_index(drop=True)
 
 
-def _fetch_broker_agg_for_stock(stock_id: str, start_date: str, end_date: str) -> pd.DataFrame:
-    try:
-        df = finmind_get(
-            "TaiwanStockTradingDailyReportSecIdAgg",
-            data_id=stock_id,
-            start_date=start_date,
-            end_date=end_date,
-        )
-        if df.empty:
-            return pd.DataFrame()
+def _coerce_trading_daily_report_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
 
-        df["stock_id"] = df["stock_id"].astype(str)
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df["buy_volume"] = pd.to_numeric(df.get("buy_volume"), errors="coerce").fillna(0)
-        df["sell_volume"] = pd.to_numeric(df.get("sell_volume"), errors="coerce").fillna(0)
-        df["net"] = df["buy_volume"] - df["sell_volume"]
-        return df.dropna(subset=["date"]).copy()
-    except Exception as e:
-        print(f"[FINMIND] broker agg fetch failed | stock_id={stock_id} | err={e}")
+    out = df.copy()
+
+    if "stock_id" in out.columns:
+        out["stock_id"] = out["stock_id"].astype(str)
+
+    if "date" in out.columns:
+        out["date"] = pd.to_datetime(out["date"], errors="coerce")
+
+    if "buy" in out.columns:
+        out["buy"] = pd.to_numeric(out["buy"], errors="coerce").fillna(0)
+    if "sell" in out.columns:
+        out["sell"] = pd.to_numeric(out["sell"], errors="coerce").fillna(0)
+
+    out = out.dropna(subset=["date"]).copy()
+    return out
+
+
+def _finmind_trading_daily_report(
+    stock_id: str | None = None,
+    trade_date: str | None = None,
+) -> pd.DataFrame:
+    params: dict[str, Any] = {}
+    if stock_id not in (None, ""):
+        params["data_id"] = stock_id
+    if trade_date not in (None, ""):
+        params["date"] = trade_date
+
+    data = _request_finmind_special("taiwan_stock_trading_daily_report", params)
+    if not data:
         return pd.DataFrame()
+
+    return _coerce_trading_daily_report_df(pd.DataFrame(data))
+
+
+def _fetch_broker_day_all(trade_date: str) -> pd.DataFrame:
+    try:
+        return _finmind_trading_daily_report(trade_date=trade_date)
+    except Exception as e:
+        print(f"[FINMIND] broker daily all fetch failed | date={trade_date} | err={e}")
+        return pd.DataFrame()
+
+
+def _fetch_broker_day_by_stock(stock_id: str, trade_date: str) -> pd.DataFrame:
+    try:
+        return _finmind_trading_daily_report(stock_id=stock_id, trade_date=trade_date)
+    except Exception as e:
+        print(f"[FINMIND] broker daily stock fetch failed | stock_id={stock_id} | date={trade_date} | err={e}")
+        return pd.DataFrame()
+
+
+def _fetch_broker_range_for_stock(stock_id: str, trading_dates: list[str]) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for d in trading_dates:
+        daily = _fetch_broker_day_by_stock(stock_id, d)
+        if not daily.empty:
+            frames.append(daily)
+
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, ignore_index=True)
+    if "stock_id" not in df.columns:
+        df["stock_id"] = stock_id
+    return df
 
 
 def _build_broker_summary(stock_id: str, df: pd.DataFrame) -> dict[str, Any]:
@@ -366,19 +423,21 @@ def _build_broker_summary(stock_id: str, df: pd.DataFrame) -> dict[str, Any]:
             "broker_buy_5d": 0.0,
         }
 
-    df = df.sort_values("date").copy()
-    all_dates = sorted(df["date"].dropna().unique().tolist())
+    out = df.copy()
+    out["net"] = pd.to_numeric(out["buy"], errors="coerce").fillna(0) - pd.to_numeric(out["sell"], errors="coerce").fillna(0)
+
+    all_dates = sorted(out["date"].dropna().unique().tolist())
     recent10 = all_dates[-10:]
     recent5 = all_dates[-5:]
 
     by_broker_10 = (
-        df[df["date"].isin(recent10)]
+        out[out["date"].isin(recent10)]
         .groupby("securities_trader", as_index=False)["net"]
         .sum()
         .sort_values("net", ascending=False)
     )
     by_broker_5 = (
-        df[df["date"].isin(recent5)]
+        out[out["date"].isin(recent5)]
         .groupby("securities_trader", as_index=False)["net"]
         .sum()
         .sort_values("net", ascending=False)
@@ -396,21 +455,78 @@ def _build_broker_summary(stock_id: str, df: pd.DataFrame) -> dict[str, Any]:
 
 def _build_broker_detail_rows(stock_id: str, df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
-        return pd.DataFrame(columns=["stock_id", "broker_name", "branch_name", "buy", "sell", "net"])
+        return pd.DataFrame(
+            columns=[
+                "stock_id",
+                "broker_name",
+                "branch_name",
+                "buy",
+                "sell",
+                "net",
+                "buy_5d",
+                "sell_5d",
+                "net_5d",
+                "buy_10d",
+                "sell_10d",
+                "net_10d",
+            ]
+        )
 
-    grouped = (
-        df.groupby(["stock_id", "securities_trader"], as_index=False)[["buy_volume", "sell_volume", "net"]]
+    out = df.copy()
+    out["buy"] = pd.to_numeric(out["buy"], errors="coerce").fillna(0)
+    out["sell"] = pd.to_numeric(out["sell"], errors="coerce").fillna(0)
+    out["net"] = out["buy"] - out["sell"]
+
+    all_dates = sorted(out["date"].dropna().unique().tolist())
+    recent10 = all_dates[-10:]
+    recent5 = all_dates[-5:]
+
+    grouped10 = (
+        out[out["date"].isin(recent10)]
+        .groupby(["stock_id", "securities_trader"], as_index=False)[["buy", "sell", "net"]]
         .sum()
-        .sort_values("net", ascending=False)
-        .copy()
+        .rename(columns={"buy": "buy_10d", "sell": "sell_10d", "net": "net_10d"})
     )
 
-    grouped["broker_name"] = grouped["securities_trader"]
-    grouped["branch_name"] = None
-    grouped["buy"] = grouped["buy_volume"]
-    grouped["sell"] = grouped["sell_volume"]
+    grouped5 = (
+        out[out["date"].isin(recent5)]
+        .groupby(["stock_id", "securities_trader"], as_index=False)[["buy", "sell", "net"]]
+        .sum()
+        .rename(columns={"buy": "buy_5d", "sell": "sell_5d", "net": "net_5d"})
+    )
 
-    return grouped[["stock_id", "broker_name", "branch_name", "buy", "sell", "net"]]
+    merged = grouped10.merge(
+        grouped5,
+        on=["stock_id", "securities_trader"],
+        how="outer",
+    ).fillna(0)
+
+    merged["broker_name"] = merged["securities_trader"]
+    merged["branch_name"] = None
+
+    # 預設前端顯示 10 日聚合
+    merged["buy"] = merged["buy_10d"]
+    merged["sell"] = merged["sell_10d"]
+    merged["net"] = merged["net_10d"]
+
+    merged = merged.sort_values("net_10d", ascending=False).copy()
+
+    return merged[
+        [
+            "stock_id",
+            "broker_name",
+            "branch_name",
+            "buy",
+            "sell",
+            "net",
+            "buy_5d",
+            "sell_5d",
+            "net_5d",
+            "buy_10d",
+            "sell_10d",
+            "net_10d",
+        ]
+    ]
 
 
 def get_broker_data(stock_ids: list[str]) -> pd.DataFrame:
@@ -430,39 +546,72 @@ def get_broker_data(stock_ids: list[str]) -> pd.DataFrame:
 
         return pd.DataFrame()
 
-    start_date = trading_dates[0]
-    end_date = trading_dates[-1]
-    worker_count = max(1, min(int(MAX_WORKERS), 8))
-
     # 單檔：回傳券商明細，給個股頁用
     if len(ids) == 1:
-        df = _fetch_broker_agg_for_stock(ids[0], start_date, end_date)
+        df = _fetch_broker_range_for_stock(ids[0], trading_dates)
         if df.empty:
-            return pd.DataFrame(columns=["stock_id", "broker_name", "branch_name", "buy", "sell", "net"])
+            return pd.DataFrame(
+                columns=[
+                    "stock_id",
+                    "broker_name",
+                    "branch_name",
+                    "buy",
+                    "sell",
+                    "net",
+                    "buy_5d",
+                    "sell_5d",
+                    "net_5d",
+                    "buy_10d",
+                    "sell_10d",
+                    "net_10d",
+                ]
+            )
         return _build_broker_detail_rows(ids[0], df)
 
-    # 多檔：回傳聚合後欄位，給 scanner 用
+    # 多檔：優先用「單日全市場分點」下載後過濾 stage1 股票，避免 320 檔 * 10 天逐檔打
+    frames: list[pd.DataFrame] = []
+    for d in trading_dates:
+        daily = _fetch_broker_day_all(d)
+        if daily.empty or "stock_id" not in daily.columns:
+            continue
+        daily["stock_id"] = daily["stock_id"].astype(str)
+        daily = daily[daily["stock_id"].isin(ids)].copy()
+        if not daily.empty:
+            frames.append(daily)
+
+    # fallback：若 date-only 全市場抓法失敗，再退回逐檔抓
+    if not frames:
+        print("[FINMIND] broker all-stock daily fetch unavailable, fallback to per-stock mode")
+        worker_count = max(1, min(int(MAX_WORKERS), 8))
+        rows: list[dict[str, Any]] = []
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_map = {
+                executor.submit(_fetch_broker_range_for_stock, stock_id, trading_dates): stock_id
+                for stock_id in ids
+            }
+
+            for future in as_completed(future_map):
+                stock_id = future_map[future]
+                try:
+                    df = future.result()
+                    rows.append(_build_broker_summary(stock_id, df))
+                except Exception as e:
+                    print(f"[FINMIND] broker summary failed | stock_id={stock_id} | err={e}")
+                    rows.append(
+                        {
+                            "stock_id": stock_id,
+                            "main_force_10d": 0.0,
+                            "broker_buy_5d": 0.0,
+                        }
+                    )
+
+        return pd.DataFrame(rows)
+
+    merged = pd.concat(frames, ignore_index=True)
+
     rows: list[dict[str, Any]] = []
-
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_map = {
-            executor.submit(_fetch_broker_agg_for_stock, stock_id, start_date, end_date): stock_id
-            for stock_id in ids
-        }
-
-        for future in as_completed(future_map):
-            stock_id = future_map[future]
-            try:
-                df = future.result()
-                rows.append(_build_broker_summary(stock_id, df))
-            except Exception as e:
-                print(f"[FINMIND] broker summary failed | stock_id={stock_id} | err={e}")
-                rows.append(
-                    {
-                        "stock_id": stock_id,
-                        "main_force_10d": 0.0,
-                        "broker_buy_5d": 0.0,
-                    }
-                )
+    for stock_id, sub in merged.groupby("stock_id"):
+        rows.append(_build_broker_summary(str(stock_id), sub.copy()))
 
     return pd.DataFrame(rows)
