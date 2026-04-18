@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import gc
+import random
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from typing import Any
@@ -15,8 +17,17 @@ from finmind_client import finmind_get
 
 PRICE_LOOKBACK_DAYS = 150
 MIN_UNIVERSE_SIZE = 300
-SAFE_MAX_WORKERS = 4
-FETCH_BATCH_SIZE_MULTIPLIER = 25
+
+# 先保守一點，穩定比速度重要
+SAFE_MAX_WORKERS = 2
+FETCH_BATCH_SIZE = 20
+
+# retry / backoff
+FETCH_RETRY_COUNT = 3
+FETCH_RETRY_BASE_SLEEP = 0.8
+FETCH_JITTER_MIN = 0.05
+FETCH_JITTER_MAX = 0.18
+ERROR_SAMPLE_LIMIT = 25
 
 EXCLUDED_NAME_KEYWORDS = [
     "ETF",
@@ -83,6 +94,7 @@ SNAPSHOT_COLUMNS = [
     "trade_warning",
     "is_restricted",
     "fetch_skipped_reason",
+    "fetch_error_detail",
 ]
 
 
@@ -98,10 +110,14 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
-def _to_float_series(series: pd.Series | None, fill_value: float = 0.0) -> pd.Series:
+def _to_float_series(series: pd.Series | None, fill_value: float | None = 0.0) -> pd.Series:
     if series is None:
         return pd.Series(dtype="float32")
-    out = pd.to_numeric(series, errors="coerce").fillna(fill_value)
+
+    out = pd.to_numeric(series, errors="coerce")
+    if fill_value is not None:
+        out = out.fillna(fill_value)
+
     return pd.to_numeric(out, downcast="float")
 
 
@@ -122,7 +138,7 @@ def _downcast_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     for col in bool_cols:
         df[col] = df[col].astype(bool)
 
-    for col in ("stock_id", "name", "group", "trade_warning", "fetch_skipped_reason"):
+    for col in ("stock_id", "name", "group", "trade_warning", "fetch_skipped_reason", "fetch_error_detail"):
         if col in df.columns:
             df[col] = df[col].astype("string")
 
@@ -174,7 +190,18 @@ def _pct_change_from_n_days(close: pd.Series, n: int) -> float:
     return (latest - base) / base * 100.0
 
 
-def _build_empty_row(stock_id: str, name: str, group: str, skipped_reason: str | None = None) -> dict[str, Any]:
+def _short_error_text(err: Exception) -> str:
+    text = f"{type(err).__name__}: {str(err)}".strip()
+    return text[:180] if text else type(err).__name__
+
+
+def _build_empty_row(
+    stock_id: str,
+    name: str,
+    group: str,
+    skipped_reason: str | None = None,
+    error_detail: str | None = None,
+) -> dict[str, Any]:
     return {
         "stock_id": stock_id,
         "name": name,
@@ -210,10 +237,14 @@ def _build_empty_row(stock_id: str, name: str, group: str, skipped_reason: str |
         "trade_warning": "",
         "is_restricted": False,
         "fetch_skipped_reason": skipped_reason,
+        "fetch_error_detail": error_detail,
     }
 
 
 def _build_stock_snapshot(stock_id: str, name: str, group: str, price_df: pd.DataFrame) -> dict[str, Any]:
+    if not isinstance(price_df, pd.DataFrame):
+        raise TypeError(f"price_df is not DataFrame: {type(price_df).__name__}")
+
     if price_df.empty:
         return _build_empty_row(stock_id, name, group, skipped_reason="empty_price")
 
@@ -241,14 +272,15 @@ def _build_stock_snapshot(stock_id: str, name: str, group: str, price_df: pd.Dat
     df = price_df.loc[:, keep_cols].copy()
 
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"]).sort_values("date")
+    df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
     if df.empty:
         return _build_empty_row(stock_id, name, group, skipped_reason="invalid_date")
 
-    close = _safe_series(df, "close")
-    close = _to_float_series(close)
-    valid_close_mask = close.notna()
+    close = _to_float_series(_safe_series(df, "close"), fill_value=None)
+    if close.empty:
+        return _build_empty_row(stock_id, name, group, skipped_reason="missing_close")
 
+    valid_close_mask = close.notna()
     if not valid_close_mask.any():
         return _build_empty_row(stock_id, name, group, skipped_reason="invalid_close")
 
@@ -258,11 +290,11 @@ def _build_stock_snapshot(stock_id: str, name: str, group: str, price_df: pd.Dat
     if len(close) < 70:
         return _build_empty_row(stock_id, name, group, skipped_reason="not_enough_bars")
 
-    open_ = _to_float_series(_safe_series(df, "open"), fill_value=np.nan).fillna(close)
-    high = _to_float_series(_safe_series(df, "max", "high"), fill_value=np.nan).fillna(close)
-    low = _to_float_series(_safe_series(df, "min", "low"), fill_value=np.nan).fillna(close)
-    volume = _to_float_series(_safe_series(df, "Trading_Volume", "trading_volume", "volume"))
-    trading_money = _to_float_series(_safe_series(df, "Trading_money", "trading_money"), fill_value=np.nan)
+    open_ = _to_float_series(_safe_series(df, "open"), fill_value=None).fillna(close)
+    high = _to_float_series(_safe_series(df, "max", "high"), fill_value=None).fillna(close)
+    low = _to_float_series(_safe_series(df, "min", "low"), fill_value=None).fillna(close)
+    volume = _to_float_series(_safe_series(df, "Trading_Volume", "trading_volume", "volume"), fill_value=0.0)
+    trading_money = _to_float_series(_safe_series(df, "Trading_money", "trading_money"), fill_value=None)
     trading_money = trading_money.fillna(close * volume)
 
     ma20 = close.rolling(20).mean()
@@ -358,22 +390,41 @@ def _build_stock_snapshot(stock_id: str, name: str, group: str, price_df: pd.Dat
         "trade_warning": "",
         "is_restricted": False,
         "fetch_skipped_reason": None,
+        "fetch_error_detail": None,
     }
 
 
 def _fetch_one_stock(stock_id: str, name: str, group: str, start_date: str) -> dict[str, Any]:
-    try:
-        price_df = finmind_get("TaiwanStockPrice", stock_id, start_date)
-        result = _build_stock_snapshot(stock_id, name, group, price_df)
-        del price_df
-        return result
-    except Exception:
-        return _build_empty_row(stock_id, name, group, skipped_reason="fetch_error")
+    last_error: str | None = None
+
+    for attempt in range(FETCH_RETRY_COUNT):
+        try:
+            if attempt > 0:
+                sleep_seconds = FETCH_RETRY_BASE_SLEEP * (2 ** (attempt - 1)) + random.uniform(0.0, 0.25)
+                time.sleep(sleep_seconds)
+            else:
+                time.sleep(random.uniform(FETCH_JITTER_MIN, FETCH_JITTER_MAX))
+
+            price_df = finmind_get("TaiwanStockPrice", stock_id, start_date)
+            result = _build_stock_snapshot(stock_id, name, group, price_df)
+
+            del price_df
+            return result
+
+        except Exception as e:
+            last_error = _short_error_text(e)
+
+    return _build_empty_row(
+        stock_id,
+        name,
+        group,
+        skipped_reason="fetch_error",
+        error_detail=last_error,
+    )
 
 
 def _normalize_stock_info_df(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-
     rename_map: dict[str, str] = {}
 
     if "stock_id" not in out.columns:
@@ -473,8 +524,7 @@ def fetch_stock_universe() -> pd.DataFrame:
     excluded_count = int(info_df["is_excluded"].sum())
     print(f"[FETCH] excluded ETF/financial count: {excluded_count}")
 
-    info_df = info_df[~info_df["is_excluded"]].copy()
-    info_df = info_df.reset_index(drop=True)
+    info_df = info_df[~info_df["is_excluded"]].copy().reset_index(drop=True)
 
     print(f"[FETCH] final universe rows: {len(info_df)}")
 
@@ -509,7 +559,7 @@ def fetch_market_snapshot_parallel(progress_callback=None) -> pd.DataFrame:
     skipped = 0
 
     worker_count = min(max(1, int(MAX_WORKERS)), SAFE_MAX_WORKERS)
-    batch_size = max(worker_count * FETCH_BATCH_SIZE_MULTIPLIER, worker_count)
+    batch_size = FETCH_BATCH_SIZE
 
     print(
         f"[FETCH] start market snapshot | universe={total} "
@@ -560,7 +610,7 @@ def fetch_market_snapshot_parallel(progress_callback=None) -> pd.DataFrame:
                 else:
                     skipped += 1
 
-                if processed % 100 == 0 or processed == total:
+                if processed % 50 == 0 or processed == total:
                     print(
                         f"[FETCH] progress processed={processed}/{total} "
                         f"success={success} failed={failed} skipped={skipped}"
@@ -593,8 +643,17 @@ def fetch_market_snapshot_parallel(progress_callback=None) -> pd.DataFrame:
     if "fetch_skipped_reason" in df.columns:
         reason_counts = df["fetch_skipped_reason"].fillna("ok").value_counts(dropna=False).to_dict()
         print(f"[FETCH] skipped reason counts: {reason_counts}")
-        df = df[df["fetch_skipped_reason"].isna()].copy()
 
+    if "fetch_error_detail" in df.columns:
+        error_df = df[df["fetch_skipped_reason"] == "fetch_error"].copy()
+        if not error_df.empty:
+            error_counts = error_df["fetch_error_detail"].fillna("unknown").value_counts(dropna=False).head(ERROR_SAMPLE_LIMIT).to_dict()
+            print(f"[FETCH] fetch_error detail top {ERROR_SAMPLE_LIMIT}: {error_counts}")
+
+            sample_rows = error_df[["stock_id", "fetch_error_detail"]].head(15).to_dict(orient="records")
+            print(f"[FETCH] fetch_error samples: {sample_rows}")
+
+    df = df[df["fetch_skipped_reason"].isna()].copy()
     print(f"[FETCH] usable snapshot rows: {len(df)}")
 
     if df.empty:
