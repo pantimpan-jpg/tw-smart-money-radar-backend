@@ -1329,7 +1329,7 @@ def get_stock_detail(stock_id: str) -> dict[str, Any]:
     in_selected = bool(ctx["in_selected"])
     overview = build_overview_from_row(row, in_selected=in_selected)
 
-    enrich_overview_with_price(overview, stock_id)
+    price_df = enrich_overview_with_price(overview, stock_id)
     enrich_overview_with_per(stock_id, overview)
     institutional_summary = enrich_overview_with_institutional(stock_id, overview)
     margin_summary = enrich_overview_with_margin(stock_id, overview)
@@ -1353,6 +1353,8 @@ def get_stock_detail(stock_id: str) -> dict[str, Any]:
     return {
         "meta": build_stock_meta(stock_id, in_selected=in_selected, source=ctx["source"]),
         "overview": overview,
+        "company_profile": build_company_profile(stock_id, overview),
+        "price_history_180": build_price_history_180(price_df),
         "revenues": get_revenues_list(stock_id),
         "eps_list": get_eps_list(stock_id),
         "dividends": get_dividends_list(stock_id),
