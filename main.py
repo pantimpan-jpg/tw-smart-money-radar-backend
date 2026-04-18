@@ -416,9 +416,320 @@ def build_overview_from_row(row: dict[str, Any], *, in_selected: bool) -> dict[s
         "is_restricted": bool(row.get("is_restricted", False)),
     }
 
+COMPANY_PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
+    "8046": {
+        "industry_role": "ABF載板代表廠商 / 載板供應鏈中游",
+        "one_liner": "IC 載板與 ABF 載板供應商",
+        "positioning": "高階封裝與高速運算載板供應鏈",
+        "core_tech": ["ABF載板", "高密度互連", "細線路製程"],
+        "main_applications": ["AI/HPC", "伺服器", "網通晶片"],
+    },
+    "3037": {
+        "industry_role": "ABF載板代表廠商 / 載板供應鏈中游",
+        "one_liner": "IC 載板與高階 ABF 載板供應商",
+        "positioning": "先進封裝與高階運算載板供應鏈",
+        "core_tech": ["ABF載板", "IC載板", "高層數載板"],
+        "main_applications": ["AI/HPC", "伺服器", "網通"],
+    },
+    "3189": {
+        "industry_role": "ABF載板代表廠商 / 載板供應鏈中游",
+        "one_liner": "IC 載板與 ABF 載板供應商",
+        "positioning": "高階封裝與高速傳輸載板供應鏈",
+        "core_tech": ["ABF載板", "封裝載板", "高速訊號傳輸"],
+        "main_applications": ["AI/HPC", "伺服器", "消費電子"],
+    },
+    "3504": {
+        "industry_role": "光學元件代表廠商 / 光學供應鏈中游",
+        "one_liner": "投影光學與精密鏡頭模組廠",
+        "positioning": "精密光學零組件與光學模組供應商",
+        "core_tech": ["精密光學設計", "鏡頭模組", "投影光學系統"],
+        "main_applications": ["投影設備", "安控鏡頭", "車載光學"],
+    },
+    "4979": {
+        "industry_role": "光通訊代表廠商 / 光模組供應鏈中游",
+        "one_liner": "高速光通訊模組與傳輸元件廠",
+        "positioning": "資料中心高速互連供應鏈",
+        "core_tech": ["高速光模組", "光收發", "矽光子互連"],
+        "main_applications": ["AI資料中心", "高速網通", "雲端伺服器"],
+    },
+    "3163": {
+        "industry_role": "光通訊代表廠商 / 光模組供應鏈中游",
+        "one_liner": "光通訊模組與被動元件供應商",
+        "positioning": "高速光纖傳輸供應鏈",
+        "core_tech": ["光纖被動元件", "WDM", "高速傳輸模組"],
+        "main_applications": ["資料中心", "電信網路", "高速互連"],
+    },
+    "6442": {
+        "industry_role": "光通訊代表廠商 / 光模組供應鏈中游",
+        "one_liner": "高速光通訊模組供應商",
+        "positioning": "AI伺服器與資料中心高速互連供應鏈",
+        "core_tech": ["高速光模組", "光電轉換", "高速傳輸封裝"],
+        "main_applications": ["AI資料中心", "雲端伺服器", "高速網通"],
+    },
+    "3017": {
+        "industry_role": "散熱代表廠商 / 散熱供應鏈中游",
+        "one_liner": "AI 伺服器散熱廠",
+        "positioning": "高功耗運算與伺服器散熱供應鏈",
+        "core_tech": ["均熱板", "熱導管", "液冷/氣冷散熱模組"],
+        "main_applications": ["AI伺服器", "GPU伺服器", "高功耗運算"],
+    },
+    "3324": {
+        "industry_role": "散熱代表廠商 / 散熱供應鏈中游",
+        "one_liner": "AI 伺服器與高階散熱模組供應商",
+        "positioning": "高效能運算散熱供應鏈",
+        "core_tech": ["均熱板", "熱導管", "高階散熱模組"],
+        "main_applications": ["AI伺服器", "顯示卡", "高效能運算"],
+    },
+    "2383": {
+        "industry_role": "PCB/CCL代表廠商 / 材料供應鏈中游",
+        "one_liner": "高階 PCB/CCL 材料供應商",
+        "positioning": "高速傳輸與伺服器板材供應鏈",
+        "core_tech": ["高速低損耗材料", "CCL", "高階板材"],
+        "main_applications": ["AI伺服器", "交換器", "高頻高速板"],
+    },
+    "6274": {
+        "industry_role": "PCB/CCL代表廠商 / 材料供應鏈中游",
+        "one_liner": "高階 CCL 與伺服器板材供應商",
+        "positioning": "高速傳輸與網通板材供應鏈",
+        "core_tech": ["低損耗材料", "CCL", "高頻高速板材"],
+        "main_applications": ["交換器", "伺服器", "網通設備"],
+    },
+    "5274": {
+        "industry_role": "BMC晶片代表廠商 / 半導體供應鏈中游",
+        "one_liner": "伺服器管理晶片與 BMC 晶片供應商",
+        "positioning": "AI伺服器管理控制供應鏈",
+        "core_tech": ["BMC", "遠端管理", "伺服器控制晶片"],
+        "main_applications": ["AI伺服器", "雲端資料中心", "企業伺服器"],
+    },
+}
+
+THEME_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
+    "ABF載板": {
+        "industry_role": "ABF載板代表廠商 / 載板供應鏈中游",
+        "one_liner": "IC 載板與 ABF 載板供應商",
+        "positioning": "先進封裝與高階運算載板供應鏈",
+        "core_tech": ["ABF載板", "封裝載板", "高密度互連"],
+        "main_applications": ["AI/HPC", "伺服器", "網通晶片"],
+    },
+    "CPO/矽光子": {
+        "industry_role": "矽光子 / 光通訊代表廠商 / 光模組供應鏈中游",
+        "one_liner": "高速光通訊與矽光子互連供應商",
+        "positioning": "AI資料中心高速互連供應鏈",
+        "core_tech": ["矽光子", "CPO", "高速光模組"],
+        "main_applications": ["AI資料中心", "雲端伺服器", "高速交換器"],
+    },
+    "光通訊": {
+        "industry_role": "光通訊代表廠商 / 光模組供應鏈中游",
+        "one_liner": "高速光通訊模組供應商",
+        "positioning": "資料中心與電信高速傳輸供應鏈",
+        "core_tech": ["光模組", "光收發", "高速傳輸"],
+        "main_applications": ["資料中心", "電信網路", "高速網通"],
+    },
+    "AI伺服器/BMC": {
+        "industry_role": "AI伺服器控制晶片代表廠商 / 半導體供應鏈中游",
+        "one_liner": "伺服器管理晶片與控制晶片供應商",
+        "positioning": "資料中心與AI伺服器管理供應鏈",
+        "core_tech": ["BMC", "伺服器管理控制", "遠端管理晶片"],
+        "main_applications": ["AI伺服器", "資料中心", "企業伺服器"],
+    },
+    "AI伺服器/OEM": {
+        "industry_role": "AI伺服器代表廠商 / 組裝供應鏈下游",
+        "one_liner": "AI 伺服器整機與系統供應商",
+        "positioning": "雲端與高效能運算系統供應鏈",
+        "core_tech": ["伺服器整機", "系統整合", "高密度運算平台"],
+        "main_applications": ["AI伺服器", "資料中心", "雲端運算"],
+    },
+    "散熱": {
+        "industry_role": "散熱代表廠商 / 散熱供應鏈中游",
+        "one_liner": "AI 伺服器散熱廠",
+        "positioning": "高功耗運算散熱供應鏈",
+        "core_tech": ["均熱板", "熱導管", "散熱模組"],
+        "main_applications": ["AI伺服器", "GPU伺服器", "高效能運算"],
+    },
+    "PCB/CCL": {
+        "industry_role": "PCB/CCL代表廠商 / 材料供應鏈中游",
+        "one_liner": "高階 PCB/CCL 材料供應商",
+        "positioning": "高速傳輸板材供應鏈",
+        "core_tech": ["CCL", "低損耗材料", "高階板材"],
+        "main_applications": ["AI伺服器", "交換器", "高頻高速板"],
+    },
+    "網通": {
+        "industry_role": "網通代表廠商 / 網通供應鏈中下游",
+        "one_liner": "網路通訊設備與模組供應商",
+        "positioning": "高速傳輸與資料交換供應鏈",
+        "core_tech": ["交換器", "路由器", "高速傳輸模組"],
+        "main_applications": ["資料中心", "企業網路", "高速網通"],
+    },
+    "低軌衛星": {
+        "industry_role": "低軌衛星概念代表廠商 / 通訊供應鏈中游",
+        "one_liner": "衛星通訊零組件與天線供應商",
+        "positioning": "衛星與長距通訊供應鏈",
+        "core_tech": ["衛星通訊", "高頻天線", "射頻模組"],
+        "main_applications": ["低軌衛星", "通訊設備", "長距傳輸"],
+    },
+    "MLCC/被動元件": {
+        "industry_role": "被動元件代表廠商 / 零組件供應鏈中游",
+        "one_liner": "MLCC 與被動元件供應商",
+        "positioning": "電子零組件基礎供應鏈",
+        "core_tech": ["MLCC", "電容", "高可靠度被動元件"],
+        "main_applications": ["手機", "車用電子", "伺服器"],
+    },
+    "半導體設備/測試": {
+        "industry_role": "半導體設備代表廠商 / 設備供應鏈中游",
+        "one_liner": "半導體設備與測試方案供應商",
+        "positioning": "晶圓製程與封測設備供應鏈",
+        "core_tech": ["測試設備", "晶圓製程設備", "封測設備"],
+        "main_applications": ["晶圓製造", "封裝測試", "先進製程"],
+    },
+    "記憶體": {
+        "industry_role": "記憶體代表廠商 / 半導體供應鏈中游",
+        "one_liner": "記憶體與儲存解決方案供應商",
+        "positioning": "DRAM / NAND 與儲存供應鏈",
+        "core_tech": ["DRAM", "NAND", "儲存控制"],
+        "main_applications": ["伺服器", "PC", "消費電子"],
+    },
+}
+
+INDUSTRY_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
+    "光電": {
+        "industry_role": "光電供應鏈中游",
+        "one_liner": "光學與光電零組件供應商",
+        "positioning": "精密光學與光電供應鏈",
+        "core_tech": ["光學設計", "光電模組", "精密製程"],
+        "main_applications": ["鏡頭", "顯示", "感測"],
+    },
+    "電子零組件": {
+        "industry_role": "電子零組件供應鏈中游",
+        "one_liner": "電子零組件供應商",
+        "positioning": "基礎電子零組件供應鏈",
+        "core_tech": ["零組件製造", "高可靠度元件", "精密製程"],
+        "main_applications": ["伺服器", "車用", "消費電子"],
+    },
+    "電腦及週邊": {
+        "industry_role": "電腦及週邊供應鏈中下游",
+        "one_liner": "電腦與系統周邊供應商",
+        "positioning": "系統整合與周邊設備供應鏈",
+        "core_tech": ["系統整合", "板卡/周邊", "硬體設計"],
+        "main_applications": ["PC", "伺服器", "企業設備"],
+    },
+    "半導體": {
+        "industry_role": "半導體供應鏈中游",
+        "one_liner": "半導體元件與晶片供應商",
+        "positioning": "IC 設計 / 製造 / 應用供應鏈",
+        "core_tech": ["IC設計", "先進製程", "高效能晶片"],
+        "main_applications": ["伺服器", "網通", "消費電子"],
+    },
+}
+
+
+def _ensure_list_text(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            text = safe_str(item)
+            if text:
+                out.append(text)
+        return out
+
+    text = safe_str(value)
+    if not text:
+        return []
+
+    parts = re.split(r"[、,/|]+", text)
+    return [part.strip() for part in parts if part and part.strip()]
+
+
+def _merge_profile(base: dict[str, Any], extra: dict[str, Any] | None) -> dict[str, Any]:
+    if not extra:
+        return base
+
+    for key in ["industry_role", "one_liner", "positioning"]:
+        if extra.get(key):
+            base[key] = extra[key]
+
+    for key in ["core_tech", "main_applications"]:
+        merged = _ensure_list_text(base.get(key)) + _ensure_list_text(extra.get(key))
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in merged:
+            if item not in seen:
+                seen.add(item)
+                deduped.append(item)
+        base[key] = deduped[:8]
+
+    return base
+
+
+def build_company_profile(stock_id: str, overview: dict[str, Any]) -> dict[str, Any]:
+    industry = safe_str(overview.get("industry")) or "待補"
+    theme = safe_str(overview.get("theme")) or None
+
+    profile: dict[str, Any] = {
+        "stock_id": stock_id,
+        "industry": industry,
+        "theme": theme,
+        "industry_role": None,
+        "one_liner": None,
+        "positioning": None,
+        "core_tech": [],
+        "main_applications": [],
+    }
+
+    profile = _merge_profile(profile, INDUSTRY_PROFILE_DEFAULTS.get(industry))
+    if theme:
+        profile = _merge_profile(profile, THEME_PROFILE_DEFAULTS.get(theme))
+    profile = _merge_profile(profile, COMPANY_PROFILE_OVERRIDES.get(stock_id))
+
+    if not profile.get("industry_role"):
+        profile["industry_role"] = f"{theme or industry} 供應鏈代表廠商"
+
+    if not profile.get("one_liner"):
+        if theme:
+            profile["one_liner"] = f"{theme} 相關供應商"
+        else:
+            profile["one_liner"] = f"{industry} 相關供應商"
+
+    if not profile.get("positioning"):
+        if theme and industry:
+            profile["positioning"] = f"{theme} / {industry} 供應鏈"
+        elif theme:
+            profile["positioning"] = f"{theme} 供應鏈"
+        else:
+            profile["positioning"] = f"{industry} 供應鏈"
+
+    if not profile.get("core_tech"):
+        profile["core_tech"] = ["待補"]
+
+    if not profile.get("main_applications"):
+        profile["main_applications"] = ["待補"]
+
+    return profile
+
+
+def build_price_history_180(price_df: pd.DataFrame) -> list[dict[str, Any]]:
+    if price_df.empty or "date" not in price_df.columns or "close" not in price_df.columns:
+        return []
+
+    df = price_df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df = df.dropna(subset=["date", "close"]).sort_values("date").tail(180)
+
+    out: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        out.append(
+            {
+                "date": pd.Timestamp(row["date"]).strftime("%Y-%m-%d"),
+                "close": float(row["close"]),
+            }
+        )
+    return out
 
 def get_recent_price_df(stock_id: str) -> pd.DataFrame:
-    start_date = (date.today() - timedelta(days=220)).isoformat()
+    # 180 個交易日大概需要接近 9~12 個月的日曆天數，這裡多抓一點再 tail(180)
+    start_date = (date.today() - timedelta(days=320)).isoformat()
     return finmind_get("TaiwanStockPrice", stock_id, start_date)
 
 
