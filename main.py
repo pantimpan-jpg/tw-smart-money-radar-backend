@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import threading
+import html
+import re
 import traceback
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -604,6 +606,9 @@ def get_margin_summary(stock_id: str) -> dict[str, Any]:
 
     margin_col = "MarginPurchaseTodayBalance" if "MarginPurchaseTodayBalance" in df.columns else None
     short_col = "ShortSaleTodayBalance" if "ShortSaleTodayBalance" in df.columns else None
+    margin_yesterday_col = "MarginPurchaseYesterdayBalance" if "MarginPurchaseYesterdayBalance" in df.columns else None
+    short_yesterday_col = "ShortSaleYesterdayBalance" if "ShortSaleYesterdayBalance" in df.columns else None
+
     if margin_col is None or short_col is None:
         return empty_result
 
@@ -614,43 +619,55 @@ def get_margin_summary(stock_id: str) -> dict[str, Any]:
 
     df["margin_balance"] = pd.to_numeric(df[margin_col], errors="coerce")
     df["short_balance"] = pd.to_numeric(df[short_col], errors="coerce")
-    df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
 
-    def calc_change(col: str, days: int) -> int | None:
-        sub = df[["date", col]].dropna().copy().sort_values("date").reset_index(drop=True)
+    if margin_yesterday_col:
+        df["margin_yesterday_balance"] = pd.to_numeric(df[margin_yesterday_col], errors="coerce")
+    else:
+        df["margin_yesterday_balance"] = np.nan
+
+    if short_yesterday_col:
+        df["short_yesterday_balance"] = pd.to_numeric(df[short_yesterday_col], errors="coerce")
+    else:
+        df["short_yesterday_balance"] = np.nan
+
+    df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+
+    def calc_change(col: str, days: int, yesterday_col: str | None = None) -> int | None:
+        sub = df[["date", col] + ([yesterday_col] if yesterday_col else [])].dropna(subset=[col]).copy()
         if sub.empty:
             return None
+
         latest_value = sub.iloc[-1][col]
 
         if days == 1:
+            if yesterday_col and yesterday_col in sub.columns and pd.notna(sub.iloc[-1][yesterday_col]):
+                return int(round(latest_value - sub.iloc[-1][yesterday_col]))
             if len(sub) < 2:
                 return None
-            prev_value = sub.iloc[-2][col]
-            return int(round((latest_value - prev_value) / 1000.0))
+            return int(round(latest_value - sub.iloc[-2][col]))
 
         if len(sub) <= days:
             return None
 
         base_value = sub.iloc[-(days + 1)][col]
-        return int(round((latest_value - base_value) / 1000.0))
+        return int(round(latest_value - base_value))
 
     latest_date = df.iloc[-1]["date"]
-
     latest_margin_balance = df.iloc[-1]["margin_balance"]
     latest_short_balance = df.iloc[-1]["short_balance"]
 
     return {
         "latest_date": latest_date.date().isoformat() if pd.notna(latest_date) else None,
-        "margin_balance": int(round(latest_margin_balance / 1000.0)) if pd.notna(latest_margin_balance) else None,
-        "short_balance": int(round(latest_short_balance / 1000.0)) if pd.notna(latest_short_balance) else None,
+        "margin_balance": int(round(latest_margin_balance)) if pd.notna(latest_margin_balance) else None,
+        "short_balance": int(round(latest_short_balance)) if pd.notna(latest_short_balance) else None,
         "margin": {
-            "d1": calc_change("margin_balance", 1),
+            "d1": calc_change("margin_balance", 1, "margin_yesterday_balance"),
             "d5": calc_change("margin_balance", 5),
             "d10": calc_change("margin_balance", 10),
             "d20": calc_change("margin_balance", 20),
         },
         "short": {
-            "d1": calc_change("short_balance", 1),
+            "d1": calc_change("short_balance", 1, "short_yesterday_balance"),
             "d5": calc_change("short_balance", 5),
             "d10": calc_change("short_balance", 10),
             "d20": calc_change("short_balance", 20),
@@ -818,34 +835,67 @@ def get_financials_list(stock_id: str) -> list[dict[str, Any]]:
 
 
 def get_news_list(stock_id: str) -> list[dict[str, Any]]:
-    start_date = (date.today() - timedelta(days=14)).isoformat()
-    df = finmind_get("TaiwanStockNews", stock_id, start_date)
-    if df.empty:
-        return []
+    def clean_html_text(value: Any) -> str | None:
+        text = safe_str(value)
+        if not text:
+            return None
+        text = html.unescape(text)
+        text = re.sub(r"<[^>]+>", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text or None
 
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.sort_values("date", ascending=False)
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
 
-    out: list[dict[str, Any]] = []
-    for _, row in df.head(20).iterrows():
-        published_at = None
-        row_date = row.get("date")
-        if pd.notna(row_date):
-            published_at = pd.Timestamp(row_date).strftime("%Y-%m-%d %H:%M:%S")
+    # FinMind v4 的 TaiwanStockNews 一次只提供一天資料，所以逐日抓
+    for offset in range(0, 20):
+        query_date = (date.today() - timedelta(days=offset)).isoformat()
 
-        out.append(
-            {
-                "id": None,
-                "title": safe_str(row.get("title")) or "待補",
-                "summary": safe_str(row.get("description")),
-                "source": safe_str(row.get("source")),
-                "published_at": published_at,
-                "url": safe_str(row.get("link")),
-            }
-        )
-    return out
+        try:
+            df = finmind_get("TaiwanStockNews", stock_id, query_date)
+        except Exception:
+            continue
 
+        if df.empty:
+            continue
+
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.sort_values("date", ascending=False)
+
+        for _, row in df.iterrows():
+            title = clean_html_text(row.get("title")) or "待補"
+            link = safe_str(row.get("link")) or ""
+
+            dedupe_key = (title, link)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            published_at = None
+            row_date = row.get("date")
+            if pd.notna(row_date):
+                published_at = pd.Timestamp(row_date).strftime("%Y-%m-%d %H:%M:%S")
+
+            rows.append(
+                {
+                    "id": None,
+                    "title": title,
+                    "summary": clean_html_text(row.get("description")),
+                    "source": clean_html_text(row.get("source")),
+                    "published_at": published_at,
+                    "url": safe_str(row.get("link")),
+                }
+            )
+
+            if len(rows) >= 20:
+                break
+
+        if len(rows) >= 20:
+            break
+
+    rows.sort(key=lambda x: x.get("published_at") or "", reverse=True)
+    return rows
 
 def get_broker_branches_list(stock_id: str) -> list[dict[str, Any]]:
     df = _get_live_broker_df(stock_id)
