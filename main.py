@@ -973,6 +973,22 @@ def get_stock_detail(stock_id: str) -> dict[str, Any]:
     institutional_summary = enrich_overview_with_institutional(stock_id, overview)
     margin_summary = enrich_overview_with_margin(stock_id, overview)
 
+    broker_df = _get_live_broker_df(stock_id)
+    _enrich_overview_with_live_broker(overview, broker_df)
+
+    broker_branches: list[dict[str, Any]] = []
+    if not broker_df.empty:
+        for _, broker_row in broker_df.head(20).iterrows():
+            broker_branches.append(
+                {
+                    "broker_name": safe_str(broker_row.get("broker_name")) or safe_str(broker_row.get("securities_trader")) or "待補",
+                    "branch_name": safe_str(broker_row.get("branch_name")),
+                    "buy": safe_float(broker_row.get("buy")),
+                    "sell": safe_float(broker_row.get("sell")),
+                    "net": safe_float(broker_row.get("net")),
+                }
+            )
+
     return {
         "meta": build_stock_meta(stock_id, in_selected=in_selected, source=ctx["source"]),
         "overview": overview,
@@ -981,7 +997,7 @@ def get_stock_detail(stock_id: str) -> dict[str, Any]:
         "dividends": get_dividends_list(stock_id),
         "financials": get_financials_list(stock_id),
         "news": get_news_list(stock_id),
-        "broker_branches": get_broker_branches_list(stock_id),
+        "broker_branches": broker_branches,
         "institutional_summary": institutional_summary,
         "margin_summary": margin_summary,
     }
