@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -14,23 +14,31 @@ from config import (
     FINMIND_API_TOKEN,
     FINMIND_BASE_URL,
     INSTITUTIONAL_CSV,
-    MAX_WORKERS,
     REQUEST_TIMEOUT,
     RETRY_TIMES,
     REVENUE_CSV,
 )
 
 SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "tw-smart-money-radar/1.0"})
 
-SPECIAL_BASE_URL = (
-    FINMIND_BASE_URL[:-5] if FINMIND_BASE_URL.endswith("/data") else FINMIND_BASE_URL
-)
+
+class FinMindRequestError(RuntimeError):
+    pass
+
+
+class FinMindBadRequest(FinMindRequestError):
+    pass
 
 
 def _auth_headers() -> dict[str, str]:
     if not FINMIND_API_TOKEN:
         return {}
     return {"Authorization": f"Bearer {FINMIND_API_TOKEN}"}
+
+
+def _sleep_backoff(attempt: int) -> None:
+    time.sleep(0.8 * (attempt + 1))
 
 
 def _request_json(url: str, params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -44,34 +52,74 @@ def _request_json(url: str, params: dict[str, Any]) -> list[dict[str, Any]]:
                 params=params,
                 timeout=REQUEST_TIMEOUT,
             )
-            response.raise_for_status()
+        except requests.RequestException as e:
+            last_error = e
+            if attempt < RETRY_TIMES:
+                _sleep_backoff(attempt)
+                continue
+            raise FinMindRequestError(
+                f"FinMind request failed: url={url}, params={params} | err={e}"
+            ) from e
 
+        # 400/401/403/404 這類通常不是 retry 能解的，直接停
+        if response.status_code in {400, 401, 403, 404}:
+            raise FinMindBadRequest(
+                f"FinMind bad request: url={url}, params={params} | "
+                f"status={response.status_code} | text={response.text[:200]}"
+            )
+
+        # 429 / 5xx 才做 retry
+        if response.status_code == 429 or 500 <= response.status_code < 600:
+            last_error = FinMindRequestError(
+                f"FinMind retryable error: url={url}, params={params} | "
+                f"status={response.status_code} | text={response.text[:200]}"
+            )
+            if attempt < RETRY_TIMES:
+                _sleep_backoff(attempt)
+                continue
+            raise last_error
+
+        try:
             payload = response.json()
+        except Exception as e:
+            last_error = e
+            if attempt < RETRY_TIMES:
+                _sleep_backoff(attempt)
+                continue
+            raise FinMindRequestError(
+                f"FinMind json decode failed: url={url}, params={params} | err={e}"
+            ) from e
+
+        if isinstance(payload, dict):
             status = payload.get("status")
             if status not in (200, None):
                 msg = payload.get("msg", "unknown error")
-                raise RuntimeError(f"FinMind API error: status={status}, msg={msg}")
+                err = FinMindRequestError(
+                    f"FinMind API error: url={url}, params={params} | status={status}, msg={msg}"
+                )
+                last_error = err
+                if attempt < RETRY_TIMES:
+                    _sleep_backoff(attempt)
+                    continue
+                raise err
 
             data = payload.get("data", [])
             if not isinstance(data, list):
                 return []
             return data
 
-        except Exception as e:
-            last_error = e
-            if attempt < RETRY_TIMES:
-                time.sleep(0.8 * (attempt + 1))
+        if isinstance(payload, list):
+            return payload
 
-    raise RuntimeError(f"FinMind request failed: url={url}, params={params} | err={last_error}")
+        return []
+
+    raise FinMindRequestError(
+        f"FinMind request failed: url={url}, params={params} | err={last_error}"
+    )
 
 
 def _request_finmind_data(params: dict[str, Any]) -> list[dict[str, Any]]:
     return _request_json(FINMIND_BASE_URL, params)
-
-
-def _request_finmind_special(path: str, params: dict[str, Any]) -> list[dict[str, Any]]:
-    url = f"{SPECIAL_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
-    return _request_json(url, params)
 
 
 def finmind_get(
@@ -111,20 +159,28 @@ def _normalize_stock_ids(stock_ids: list[str] | tuple[str, ...] | set[str]) -> l
     return sorted({str(x).strip() for x in stock_ids if str(x).strip()})
 
 
-def _recent_trading_dates(n: int) -> list[str]:
+@lru_cache(maxsize=1)
+def _recent_trading_dates_cache() -> tuple[str, ...]:
     df = finmind_get("TaiwanStockTradingDate")
     if df.empty or "date" not in df.columns:
-        return []
+        return tuple()
 
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date"]).sort_values("date")
     if df.empty:
-        return []
+        return tuple()
 
     today = pd.Timestamp(date.today())
     df = df[df["date"] <= today]
 
-    return df.tail(n)["date"].dt.strftime("%Y-%m-%d").tolist()
+    return tuple(df["date"].dt.strftime("%Y-%m-%d").tolist())
+
+
+def _recent_trading_dates(n: int) -> list[str]:
+    dates = list(_recent_trading_dates_cache())
+    if not dates:
+        return []
+    return dates[-n:]
 
 
 def _recent_month_starts(n: int) -> list[str]:
@@ -182,6 +238,7 @@ def get_institutional_data(stock_ids: list[str]) -> pd.DataFrame:
             daily = finmind_get(
                 "TaiwanStockInstitutionalInvestorsBuySell",
                 start_date=d,
+                end_date=d,
             )
             if daily.empty or "stock_id" not in daily.columns:
                 continue
@@ -366,34 +423,20 @@ def _coerce_trading_daily_report_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _finmind_trading_daily_report(
-    stock_id: str | None = None,
-    trade_date: str | None = None,
-) -> pd.DataFrame:
-    params: dict[str, Any] = {}
-    if stock_id not in (None, ""):
-        params["data_id"] = stock_id
-    if trade_date not in (None, ""):
-        params["date"] = trade_date
-
-    data = _request_finmind_special("taiwan_stock_trading_daily_report", params)
-    if not data:
-        return pd.DataFrame()
-
-    return _coerce_trading_daily_report_df(pd.DataFrame(data))
-
-
-def _fetch_broker_day_all(trade_date: str) -> pd.DataFrame:
-    try:
-        return _finmind_trading_daily_report(trade_date=trade_date)
-    except Exception as e:
-        print(f"[FINMIND] broker daily all fetch failed | date={trade_date} | err={e}")
-        return pd.DataFrame()
-
-
 def _fetch_broker_day_by_stock(stock_id: str, trade_date: str) -> pd.DataFrame:
     try:
-        return _finmind_trading_daily_report(stock_id=stock_id, trade_date=trade_date)
+        df = finmind_get(
+            "TaiwanStockTradingDailyReport",
+            data_id=stock_id,
+            start_date=trade_date,
+            end_date=trade_date,
+        )
+        if df.empty:
+            return pd.DataFrame()
+        return _coerce_trading_daily_report_df(df)
+    except FinMindBadRequest as e:
+        print(f"[FINMIND] broker daily stock bad request | stock_id={stock_id} | date={trade_date} | err={e}")
+        return pd.DataFrame()
     except Exception as e:
         print(f"[FINMIND] broker daily stock fetch failed | stock_id={stock_id} | date={trade_date} | err={e}")
         return pd.DataFrame()
@@ -415,6 +458,12 @@ def _fetch_broker_range_for_stock(stock_id: str, trading_dates: list[str]) -> pd
     return df
 
 
+def _zero_broker_summary_rows(ids: list[str]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [{"stock_id": stock_id, "main_force_10d": 0.0, "broker_buy_5d": 0.0} for stock_id in ids]
+    )
+
+
 def _build_broker_summary(stock_id: str, df: pd.DataFrame) -> dict[str, Any]:
     if df.empty:
         return {
@@ -424,7 +473,21 @@ def _build_broker_summary(stock_id: str, df: pd.DataFrame) -> dict[str, Any]:
         }
 
     out = df.copy()
-    out["net"] = pd.to_numeric(out["buy"], errors="coerce").fillna(0) - pd.to_numeric(out["sell"], errors="coerce").fillna(0)
+
+    if "buy" not in out.columns:
+        out["buy"] = 0
+    if "sell" not in out.columns:
+        out["sell"] = 0
+
+    out["buy"] = pd.to_numeric(out["buy"], errors="coerce").fillna(0)
+    out["sell"] = pd.to_numeric(out["sell"], errors="coerce").fillna(0)
+    out["net"] = out["buy"] - out["sell"]
+
+    if "securities_trader" not in out.columns:
+        if "securities_trader_id" in out.columns:
+            out["securities_trader"] = out["securities_trader_id"].astype(str)
+        else:
+            out["securities_trader"] = "UNKNOWN"
 
     all_dates = sorted(out["date"].dropna().unique().tolist())
     recent10 = all_dates[-10:]
@@ -473,9 +536,21 @@ def _build_broker_detail_rows(stock_id: str, df: pd.DataFrame) -> pd.DataFrame:
         )
 
     out = df.copy()
+
+    if "buy" not in out.columns:
+        out["buy"] = 0
+    if "sell" not in out.columns:
+        out["sell"] = 0
+
     out["buy"] = pd.to_numeric(out["buy"], errors="coerce").fillna(0)
     out["sell"] = pd.to_numeric(out["sell"], errors="coerce").fillna(0)
     out["net"] = out["buy"] - out["sell"]
+
+    if "securities_trader" not in out.columns:
+        if "securities_trader_id" in out.columns:
+            out["securities_trader"] = out["securities_trader_id"].astype(str)
+        else:
+            out["securities_trader"] = "UNKNOWN"
 
     all_dates = sorted(out["date"].dropna().unique().tolist())
     recent10 = all_dates[-10:]
@@ -504,7 +579,6 @@ def _build_broker_detail_rows(stock_id: str, df: pd.DataFrame) -> pd.DataFrame:
     merged["broker_name"] = merged["securities_trader"]
     merged["branch_name"] = None
 
-    # 預設前端顯示 10 日聚合
     merged["buy"] = merged["buy_10d"]
     merged["sell"] = merged["sell_10d"]
     merged["net"] = merged["net_10d"]
@@ -538,15 +612,17 @@ def get_broker_data(stock_ids: list[str]) -> pd.DataFrame:
     if not trading_dates:
         local = _read_local_csv(BROKER_CSV)
         if local.empty:
-            return pd.DataFrame()
+            return _zero_broker_summary_rows(ids)
 
         if "stock_id" in local.columns:
             local["stock_id"] = local["stock_id"].astype(str)
-            return local[local["stock_id"].isin(ids)].copy()
+            local = local[local["stock_id"].isin(ids)].copy()
+            if not local.empty:
+                return local
 
-        return pd.DataFrame()
+        return _zero_broker_summary_rows(ids)
 
-    # 單檔：回傳券商明細，給個股頁用
+    # 單檔：給個股頁用，真的去抓 stock_id + 單日
     if len(ids) == 1:
         df = _fetch_broker_range_for_stock(ids[0], trading_dates)
         if df.empty:
@@ -568,50 +644,17 @@ def get_broker_data(stock_ids: list[str]) -> pd.DataFrame:
             )
         return _build_broker_detail_rows(ids[0], df)
 
-    # 多檔：優先用「單日全市場分點」下載後過濾 stage1 股票，避免 320 檔 * 10 天逐檔打
-    frames: list[pd.DataFrame] = []
-    for d in trading_dates:
-        daily = _fetch_broker_day_all(d)
-        if daily.empty or "stock_id" not in daily.columns:
-            continue
-        daily["stock_id"] = daily["stock_id"].astype(str)
-        daily = daily[daily["stock_id"].isin(ids)].copy()
-        if not daily.empty:
-            frames.append(daily)
+    # 多檔批量掃描：
+    # 官方文件的 TaiwanStockTradingDailyReport 是 query by 股票代碼 / 券商代碼，且單次一天。
+    # 這裡不再走 date-only 全市場特別端點，也不做逐檔 * 多天暴力 fallback。
+    # 有本地 broker cache 就用，沒有就回零，讓 bulk scan 穩定完成。
+    local = _read_local_csv(BROKER_CSV)
+    if not local.empty and "stock_id" in local.columns:
+        local["stock_id"] = local["stock_id"].astype(str)
+        local = local[local["stock_id"].isin(ids)].copy()
+        if not local.empty:
+            print(f"[FINMIND] broker bulk scan use local cache rows={len(local)}")
+            return local
 
-    # fallback：若 date-only 全市場抓法失敗，再退回逐檔抓
-    if not frames:
-        print("[FINMIND] broker all-stock daily fetch unavailable, fallback to per-stock mode")
-        worker_count = max(1, min(int(MAX_WORKERS), 8))
-        rows: list[dict[str, Any]] = []
-
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            future_map = {
-                executor.submit(_fetch_broker_range_for_stock, stock_id, trading_dates): stock_id
-                for stock_id in ids
-            }
-
-            for future in as_completed(future_map):
-                stock_id = future_map[future]
-                try:
-                    df = future.result()
-                    rows.append(_build_broker_summary(stock_id, df))
-                except Exception as e:
-                    print(f"[FINMIND] broker summary failed | stock_id={stock_id} | err={e}")
-                    rows.append(
-                        {
-                            "stock_id": stock_id,
-                            "main_force_10d": 0.0,
-                            "broker_buy_5d": 0.0,
-                        }
-                    )
-
-        return pd.DataFrame(rows)
-
-    merged = pd.concat(frames, ignore_index=True)
-
-    rows: list[dict[str, Any]] = []
-    for stock_id, sub in merged.groupby("stock_id"):
-        rows.append(_build_broker_summary(str(stock_id), sub.copy()))
-
-    return pd.DataFrame(rows)
+    print("[FINMIND] broker bulk scan disabled in multi-stock mode; fill zero summary")
+    return _zero_broker_summary_rows(ids)
