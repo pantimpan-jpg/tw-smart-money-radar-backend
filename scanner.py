@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import numpy as np
 import pandas as pd
 
@@ -60,18 +61,127 @@ EXCLUDED_GROUP_KEYWORDS = [
     "金控",
 ]
 
-THEME_RULES: dict[str, list[str]] = {
-    "記憶體": ["記憶體", "DRAM", "NAND", "NOR", "快閃記憶體", "SSD"],
-    "ABF載板": ["ABF", "載板", "IC載板"],
-    "散熱": ["散熱", "熱導管", "均熱片", "散熱模組", "風扇"],
-    "PCB": ["PCB", "印刷電路板", "銅箔基板", "CCL", "HDI", "軟板"],
-    "AI伺服器": ["AI", "伺服器", "SERVER", "GPU", "ASIC", "資料中心"],
-    "CPO/矽光子": ["CPO", "矽光子", "光通訊", "光模組", "高速光"],
-    "網通": ["網通", "網路", "交換器", "路由器", "WIFI", "乙太網路"],
-    "低軌衛星": ["低軌", "衛星", "通訊天線", "太空", "衛星通訊"],
-    "被動元件": ["被動元件", "MLCC", "電感", "電容", "電阻"],
-    "電源/BBU": ["電源", "BBU", "UPS", "電池備援", "電源供應器"],
-    "面板": ["面板", "顯示器", "LCD", "OLED", "觸控"],
+# =========================
+# 細題材 mapping：先手動股號，再股名關鍵字，再產業大類
+# 這是第一版，可隨你之後持續擴充
+# =========================
+STOCK_THEME_OVERRIDES: dict[str, str] = {
+    # CPO / 矽光子 / 光通訊
+    "4979": "CPO/矽光子",
+    "4971": "CPO/矽光子",
+    "4977": "CPO/矽光子",
+    "3363": "CPO/矽光子",
+    "3450": "CPO/矽光子",
+    "3163": "CPO/矽光子",
+    "3081": "CPO/矽光子",
+    "6442": "CPO/矽光子",
+    "3234": "CPO/矽光子",
+
+    # AI 伺服器 / ODM / BMC
+    "5274": "AI伺服器/BMC",
+    "2382": "AI伺服器/OEM",
+    "3231": "AI伺服器/OEM",
+    "6669": "AI伺服器/OEM",
+    "2357": "AI伺服器/OEM",
+    "6669": "AI伺服器/OEM",
+
+    # 散熱
+    "3017": "散熱",
+    "3653": "散熱",
+    "3324": "散熱",
+    "2421": "散熱",
+
+    # BBU / 電池備援 / 電源
+    "4931": "BBU/電池備援",
+    "3211": "BBU/電池備援",
+    "6781": "BBU/電池備援",
+    "2308": "電源/BBU",
+    "2301": "電源/BBU",
+
+    # 低軌衛星
+    "3491": "低軌衛星",
+    "2314": "低軌衛星",
+
+    # PCB / CCL / 載板
+    "6274": "PCB/CCL",
+    "2383": "PCB/CCL",
+    "3037": "PCB/CCL",
+    "8046": "PCB/CCL",
+    "6672": "PCB/CCL",
+
+    # 面板 / 觸控
+    "3673": "面板/觸控",
+    "3481": "面板/觸控",
+
+    # 記憶體
+    "8299": "記憶體",
+    "2408": "記憶體",
+    "2344": "記憶體",
+    "4967": "記憶體",
+
+    # 網通
+    "3596": "網通",
+    "4908": "網通",
+    "2345": "網通",
+
+    # 銅箔 / 材料
+    "1785": "銅箔/材料",
+}
+
+THEME_KEYWORD_RULES: list[tuple[str, list[str]]] = [
+    ("CPO/矽光子", ["華星光", "眾達", "IET", "IET-KY", "上詮", "聯鈞", "聯亞", "波若威", "光聖", "光環", "矽光子", "CPO", "光通訊", "光模組"]),
+    ("AI伺服器/BMC", ["信驊", "BMC", "伺服器", "SERVER", "資料中心", "GPU", "ASIC"]),
+    ("AI伺服器/OEM", ["廣達", "緯創", "緯穎", "華碩", "OEM", "ODM"]),
+    ("散熱", ["奇鋐", "雙鴻", "健策", "散熱", "熱導管", "均熱片", "風扇"]),
+    ("BBU/電池備援", ["新盛力", "順達", "AES", "AES-KY", "BBU", "電池備援"]),
+    ("電源/BBU", ["台達電", "光寶科", "電源", "UPS", "電源供應器"]),
+    ("低軌衛星", ["昇達科", "台揚", "衛星", "低軌", "LEO", "通訊天線"]),
+    ("PCB/CCL", ["PCB", "CCL", "銅箔基板", "台燿", "台光電", "騰輝", "高技", "印刷電路板"]),
+    ("ABF載板", ["ABF", "載板", "欣興", "景碩", "南電", "IC載板"]),
+    ("記憶體", ["記憶體", "DRAM", "NAND", "NOR", "華邦電", "群聯", "創見", "威剛"]),
+    ("面板/觸控", ["TPK", "TPK-KY", "面板", "觸控", "群創", "友達"]),
+    ("網通", ["網通", "交換器", "路由器", "乙太網路", "智易", "中磊", "啟碁"]),
+    ("MLCC/被動元件", ["MLCC", "被動元件", "電容", "電阻", "電感", "國巨", "華新科", "禾伸堂"]),
+    ("軍工/航太", ["軍工", "航太", "雷虎", "漢翔", "長榮航太"]),
+    ("半導體設備/測試", ["致茂", "測試", "ATE", "探針卡", "設備"]),
+    ("銅箔/材料", ["光洋科", "銅箔", "材料", "金屬材料"]),
+]
+
+INDUSTRY_FALLBACK_RULES: list[tuple[str, list[str]]] = [
+    ("半導體", ["半導體"]),
+    ("光電", ["光電"]),
+    ("網通", ["通信網路", "網路通訊"]),
+    ("電子零組件", ["電子零組件"]),
+    ("電腦及週邊", ["電腦及週邊"]),
+    ("其他電子", ["其他電子"]),
+    ("電機機械", ["電機機械"]),
+    ("生技醫療", ["生技醫療"]),
+    ("航運", ["航運"]),
+    ("鋼鐵", ["鋼鐵"]),
+]
+
+THEME_SORT_PRIORITY = {
+    "CPO/矽光子": 1,
+    "AI伺服器/BMC": 2,
+    "AI伺服器/OEM": 3,
+    "散熱": 4,
+    "BBU/電池備援": 5,
+    "電源/BBU": 6,
+    "低軌衛星": 7,
+    "PCB/CCL": 8,
+    "ABF載板": 9,
+    "記憶體": 10,
+    "面板/觸控": 11,
+    "網通": 12,
+    "MLCC/被動元件": 13,
+    "軍工/航太": 14,
+    "半導體設備/測試": 15,
+    "銅箔/材料": 16,
+    "半導體": 17,
+    "光電": 18,
+    "電子零組件": 19,
+    "其他電子": 20,
+    "其他": 999,
 }
 
 NUMERIC_DEFAULTS: dict[str, float] = {
@@ -96,7 +206,6 @@ NUMERIC_DEFAULTS: dict[str, float] = {
     "low_20d": 0.0,
     "high_5d": 0.0,
     "high_20d": 0.0,
-    # 新策略額外欄位，若 fetcher 還沒補，先給 fallback
     "pct_5d": 0.0,
     "pct_10d": 0.0,
     "drawdown_5d": 0.0,
@@ -108,6 +217,13 @@ NUMERIC_DEFAULTS: dict[str, float] = {
 
 def log_count(label: str, df: pd.DataFrame) -> None:
     print(f"[SCAN] {label}: {len(df)}")
+
+
+def normalize_text(value: str) -> str:
+    text = str(value or "").upper()
+    text = text.replace("－", "-").replace("—", "-").replace("–", "-")
+    text = re.sub(r"[\s_/()（）．.]+", "", text)
+    return text
 
 
 def ensure_market_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -135,7 +251,6 @@ def ensure_market_columns(df: pd.DataFrame) -> pd.DataFrame:
 def derive_pattern_features(df: pd.DataFrame) -> pd.DataFrame:
     out = ensure_market_columns(df)
 
-    # 如果 fetcher 之後補了這些欄位，就直接沿用；現在先用合理 fallback
     out["near_high20_ratio"] = np.where(
         out["high_20d"] > 0,
         out["close"] / out["high_20d"],
@@ -148,7 +263,6 @@ def derive_pattern_features(df: pd.DataFrame) -> pd.DataFrame:
         out["drawdown_5d"],
     )
 
-    # 若 fetcher 尚未提供 pct_5d / pct_10d，先用保守 fallback，之後再由 fetcher 精準補強
     out["pct_5d"] = np.where(
         out["pct_5d"] != 0,
         out["pct_5d"],
@@ -195,13 +309,23 @@ def is_excluded_stock(name: str, group: str) -> bool:
     return False
 
 
-def classify_theme(name: str, group: str) -> str:
-    text = f"{name} {group}".upper()
+def classify_theme(stock_id: str, name: str, group: str) -> str:
+    sid = str(stock_id or "").strip()
+    if sid in STOCK_THEME_OVERRIDES:
+        return STOCK_THEME_OVERRIDES[sid]
 
-    for theme, keywords in THEME_RULES.items():
+    combined_raw = f"{name} {group}"
+    combined_norm = normalize_text(combined_raw)
+
+    for theme, keywords in THEME_KEYWORD_RULES:
         for keyword in keywords:
-            if keyword.upper() in text:
+            if normalize_text(keyword) in combined_norm:
                 return theme
+
+    group_text = str(group or "")
+    for theme, keywords in INDUSTRY_FALLBACK_RULES:
+        if any(keyword in group_text for keyword in keywords):
+            return theme
 
     return "其他"
 
@@ -287,7 +411,6 @@ def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
         int((universe["near_high20_ratio"] >= STARTING_ACCUM_NEAR_HIGH20_RATIO).sum()),
     )
 
-    # 先保留最低流動性底線，不再要求成交值與均量都同時很高
     liquidity_floor = (
         (universe["turnover_100m"] >= MIN_TURNOVER_100M)
         | (universe["volume_avg20"] >= MIN_AVG_VOLUME_LOT)
@@ -310,7 +433,6 @@ def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
     if stage1_base.empty:
         return universe.head(0).copy()
 
-    # 三種模型都能進第一層的結構條件
     stage1_focus = stage1_base.loc[
         (stage1_base["pct_from_ma20"] <= max(STRONG_TREND_MAX_DISTANCE_FROM_MA20, 25))
         & (
@@ -326,7 +448,6 @@ def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
     if not stage1_focus.empty:
         return sort_stage1_candidates(stage1_focus)
 
-    # fallback 1：只要沒破壞多頭結構且接近高點，也保留
     relaxed_gate_1 = stage1_base.loc[
         (
             (stage1_base["near_high20_ratio"] >= 0.94)
@@ -341,7 +462,6 @@ def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
         print("[SCAN] Fallback used: relaxed gate 1")
         return sort_stage1_candidates(relaxed_gate_1)
 
-    # fallback 2：保留高位附近與量能還在的股票
     relaxed_gate_2 = universe.loc[
         (
             (universe["turnover_100m"] >= max(MIN_TURNOVER_100M * 0.35, 0.3))
@@ -652,7 +772,15 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = 0.0
         out[col] = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    out["theme"] = out.apply(lambda x: classify_theme(str(x["name"]), str(x["group"])), axis=1)
+    out["theme"] = out.apply(
+        lambda x: classify_theme(
+            str(x["stock_id"]),
+            str(x["name"]),
+            str(x["group"]),
+        ),
+        axis=1,
+    )
+    out["theme_priority"] = out["theme"].map(THEME_SORT_PRIORITY).fillna(999)
 
     out["institution_score"] = out.apply(calc_institution_score, axis=1)
     out["main_force_score"] = out.apply(calc_main_force_score, axis=1)
@@ -689,7 +817,6 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
         + out["revenue_score"]
     )
 
-    # 剛啟動｜爆量突破
     out["starting_breakout_score"] = 0.0
     out.loc[out["volume_ratio"] >= STARTING_BREAKOUT_MIN_VOLUME_RATIO, "starting_breakout_score"] += 7
     out.loc[out["close"] > out["platform_high_20d"], "starting_breakout_score"] += 8
@@ -707,7 +834,6 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
     out.loc[out["pct_from_ma20"] > STARTING_BREAKOUT_MAX_DISTANCE_FROM_MA20 + 3, "starting_breakout_score"] -= 6
     out.loc[out["rsi"] > 80, "starting_breakout_score"] -= 4
 
-    # 剛啟動｜收籌墊高
     out["starting_accum_score"] = 0.0
     out.loc[
         (out["pct_10d"] >= STARTING_ACCUM_10D_PCT_MIN) & (out["pct_10d"] <= STARTING_ACCUM_10D_PCT_MAX),
@@ -722,7 +848,6 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
     out.loc[out["is_macd_positive"], "starting_accum_score"] += 3
     out.loc[out["pct_from_ma20"] > 15, "starting_accum_score"] -= 4
 
-    # 第二波
     out["second_wave_score"] = 0.0
     out.loc[out["close"] > out["ma60"], "second_wave_score"] += 6
     out.loc[out["close"] > out["ma20"] * 1.02, "second_wave_score"] += 4
@@ -740,7 +865,6 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
     out.loc[out["revenue_score"] >= 5, "second_wave_score"] += 3
     out.loc[out["pct_from_ma20"] > SECOND_WAVE_MAX_DISTANCE_FROM_MA20, "second_wave_score"] -= 6
 
-    # 強者恆強
     out["strong_trend_score"] = 0.0
     out.loc[out["close"] > out["ma20"] * 1.08, "strong_trend_score"] += 7
     out.loc[out["close"] > out["ma60"], "strong_trend_score"] += 5
@@ -820,6 +944,10 @@ def build_reason_and_targets(row: pd.Series) -> dict:
         reasons.append("型態偏第二波，屬整理後再攻候選")
     elif main_tag == "強者恆強":
         reasons.append("型態偏強者恆強，屬主升段延續候選")
+
+    theme = str(row.get("theme") or "")
+    if theme and theme != "其他":
+        reasons.append(f"細題材歸類：{theme}")
 
     if row.get("institution_score", 0) >= 12:
         reasons.append("法人籌碼加分明顯")
@@ -942,6 +1070,11 @@ def build_payload(raw_df: pd.DataFrame, analyzed_df: pd.DataFrame) -> dict:
         ascending=False,
     ).head(20).copy()
 
+    all_selected_df = analyzed_df.sort_values(
+        ["theme_priority", "overall_priority_score", "turnover_100m"],
+        ascending=[True, False, False],
+    ).copy()
+
     payload = {
         "summary": {
             "market_scanned": int(len(raw_df)),
@@ -969,7 +1102,7 @@ def build_payload(raw_df: pd.DataFrame, analyzed_df: pd.DataFrame) -> dict:
         "broker_track": build_table_rows(broker_track_df),
         "overheated": build_table_rows(risk_overheated_df),
         "high_turnover": build_table_rows(high_turnover_df),
-        "all_selected": build_table_rows(analyzed_df),
+        "all_selected": build_table_rows(all_selected_df),
     }
     return payload
 
