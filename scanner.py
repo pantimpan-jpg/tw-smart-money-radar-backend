@@ -6,7 +6,6 @@ import pandas as pd
 from config import (
     BROKER_TRACK_COUNT,
     INSTITUTIONAL_CSV,
-    MAX_DISTANCE_FROM_MA20,
     MAX_PRICE,
     MIN_AVG_VOLUME_LOT,
     MIN_PRICE,
@@ -16,11 +15,29 @@ from config import (
     SECOND_SCAN_LIMIT,
     TOP30_COUNT,
     WATCHLIST_COUNT,
+    SECOND_WAVE_MAX_DISTANCE_FROM_MA20,
+    SECOND_WAVE_MAX_RSI,
+    SECOND_WAVE_MIN_RSI,
+    SECOND_WAVE_MIN_VOLUME_RATIO,
+    STARTING_ACCUM_10D_PCT_MAX,
+    STARTING_ACCUM_10D_PCT_MIN,
+    STARTING_ACCUM_5D_PULLBACK_MAX,
+    STARTING_ACCUM_CLOSE_OVER_MA20,
+    STARTING_ACCUM_NEAR_HIGH20_RATIO,
+    STARTING_ACCUM_VOL5_OVER_VOL20_MIN,
+    STARTING_BREAKOUT_MAX_DISTANCE_FROM_MA20,
+    STARTING_BREAKOUT_MIN_VOLUME_RATIO,
+    STARTING_BREAKOUT_RSI_MAX,
+    STARTING_BREAKOUT_RSI_MIN,
+    STRONG_TREND_MAX_DISTANCE_FROM_MA20,
+    STRONG_TREND_MAX_RSI,
+    STRONG_TREND_MIN_RSI,
+    STRONG_TREND_MIN_VOLUME_RATIO,
+    STRONG_TREND_NEAR_HIGH20_RATIO,
 )
 from fetcher import fetch_market_snapshot_parallel
 from finmind_client import get_broker_data, get_institutional_data, get_revenue_data
 from storage import dataframe_to_records, save_snapshot
-
 
 EXCLUDED_NAME_KEYWORDS = [
     "ETF",
@@ -79,6 +96,13 @@ NUMERIC_DEFAULTS: dict[str, float] = {
     "low_20d": 0.0,
     "high_5d": 0.0,
     "high_20d": 0.0,
+    # 新策略額外欄位，若 fetcher 還沒補，先給 fallback
+    "pct_5d": 0.0,
+    "pct_10d": 0.0,
+    "drawdown_5d": 0.0,
+    "vol5_over_vol20": 0.0,
+    "ma20_slope": 0.0,
+    "near_high20_ratio": 0.0,
 }
 
 
@@ -91,24 +115,69 @@ def ensure_market_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     if "stock_id" not in out.columns:
         out["stock_id"] = ""
-
     if "name" not in out.columns:
         out["name"] = ""
-
     if "group" not in out.columns:
         out["group"] = ""
-
-    for col, default in NUMERIC_DEFAULTS.items():
-        if col not in out.columns:
-            out[col] = default
-        out[col] = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
 
     out["stock_id"] = out["stock_id"].astype(str)
     out["name"] = out["name"].astype(str)
     out["group"] = out["group"].astype(str)
 
     for col, default in NUMERIC_DEFAULTS.items():
-        out[col] = out[col].fillna(default)
+        if col not in out.columns:
+            out[col] = default
+        out[col] = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(default)
+
+    return out
+
+
+def derive_pattern_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = ensure_market_columns(df)
+
+    # 如果 fetcher 之後補了這些欄位，就直接沿用；現在先用合理 fallback
+    out["near_high20_ratio"] = np.where(
+        out["high_20d"] > 0,
+        out["close"] / out["high_20d"],
+        out["near_high20_ratio"],
+    )
+
+    out["drawdown_5d"] = np.where(
+        out["high_5d"] > 0,
+        np.maximum(0, (out["high_5d"] - out["close"]) / out["high_5d"] * 100),
+        out["drawdown_5d"],
+    )
+
+    # 若 fetcher 尚未提供 pct_5d / pct_10d，先用保守 fallback，之後再由 fetcher 精準補強
+    out["pct_5d"] = np.where(
+        out["pct_5d"] != 0,
+        out["pct_5d"],
+        np.where(out["ma20"] > 0, np.clip(out["pct_from_ma20"] * 0.45, -20, 20), 0),
+    )
+    out["pct_10d"] = np.where(
+        out["pct_10d"] != 0,
+        out["pct_10d"],
+        np.where(out["ma20"] > 0, np.clip(out["pct_from_ma20"] * 0.85, -30, 30), 0),
+    )
+
+    out["vol5_over_vol20"] = np.where(
+        out["vol5_over_vol20"] > 0,
+        out["vol5_over_vol20"],
+        np.where(out["volume_ratio"] > 0, np.maximum(out["volume_ratio"] * 0.92, 0), 0),
+    )
+
+    out["ma20_slope"] = np.where(
+        out["ma20_slope"] != 0,
+        out["ma20_slope"],
+        np.where(out["ma60"] > 0, (out["ma20"] - out["ma60"]) / out["ma60"] * 100, 0),
+    )
+
+    out["is_above_ma20"] = out["close"] > out["ma20"]
+    out["is_above_ma60"] = out["close"] > out["ma60"]
+    out["is_near_breakout"] = out["near_high20_ratio"] >= STARTING_ACCUM_NEAR_HIGH20_RATIO
+    out["is_strong_near_high"] = out["near_high20_ratio"] >= STRONG_TREND_NEAR_HIGH20_RATIO
+    out["is_macd_positive"] = out["macd"] > out["macd_signal"]
+    out["is_macd_hist_positive"] = out["macd_hist"] > 0
 
     return out
 
@@ -154,23 +223,41 @@ def sort_stage1_candidates(df: pd.DataFrame) -> pd.DataFrame:
 
     out["sort_turnover"] = pd.to_numeric(out["turnover_100m"], errors="coerce").fillna(0)
     out["sort_volume_ratio"] = pd.to_numeric(out["volume_ratio"], errors="coerce").fillna(0)
-    out["sort_rsi_bonus"] = np.where((out["rsi"] >= 45) & (out["rsi"] <= 78), 1, 0)
+    out["sort_vol5_over_vol20"] = pd.to_numeric(out["vol5_over_vol20"], errors="coerce").fillna(0)
+    out["sort_near_high"] = pd.to_numeric(out["near_high20_ratio"], errors="coerce").fillna(0)
     out["sort_trend_bonus"] = np.where(
-        (out["close"] > out["ma20"]) | (out["close"] > out["ma60"]) | (out["macd"] > out["macd_signal"]),
+        (out["close"] > out["ma20"])
+        | (out["close"] > out["ma60"])
+        | (out["macd"] > out["macd_signal"])
+        | (out["obv_trend"] > 0),
         1,
         0,
     )
 
     out = out.sort_values(
-        ["sort_turnover", "sort_volume_ratio", "sort_rsi_bonus", "sort_trend_bonus"],
+        [
+            "sort_trend_bonus",
+            "sort_near_high",
+            "sort_turnover",
+            "sort_volume_ratio",
+            "sort_vol5_over_vol20",
+        ],
         ascending=False,
     ).head(SECOND_SCAN_LIMIT).copy()
 
-    return out.drop(columns=["sort_turnover", "sort_volume_ratio", "sort_rsi_bonus", "sort_trend_bonus"])
+    return out.drop(
+        columns=[
+            "sort_turnover",
+            "sort_volume_ratio",
+            "sort_vol5_over_vol20",
+            "sort_near_high",
+            "sort_trend_bonus",
+        ]
+    )
 
 
 def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
-    out = ensure_market_columns(df)
+    out = derive_pattern_features(df)
     out = add_exclusion_flag(out)
 
     log_count("Raw universe", out)
@@ -187,7 +274,6 @@ def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
     if universe.empty:
         return universe
 
-    # 先檢查最常出問題的欄位分布
     print(
         "[SCAN] Dist stats | turnover>=min:",
         int((universe["turnover_100m"] >= MIN_TURNOVER_100M).sum()),
@@ -197,39 +283,57 @@ def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
         int((universe["volume_avg20"] >= MIN_AVG_VOLUME_LOT).sum()),
         "| above_ma20_or_ma60:",
         int(((universe["close"] > universe["ma20"]) | (universe["close"] > universe["ma60"])).sum()),
-        "| within_ma20_distance:",
-        int((universe["pct_from_ma20"] <= MAX_DISTANCE_FROM_MA20).sum()),
+        "| near_high20:",
+        int((universe["near_high20_ratio"] >= STARTING_ACCUM_NEAR_HIGH20_RATIO).sum()),
     )
 
-    liquidity_gate = universe.loc[
-        (universe["turnover_100m"] >= max(MIN_TURNOVER_100M * 0.7, 1.5))
-        & (universe["volume_avg20"] >= max(MIN_AVG_VOLUME_LOT * 0.6, 80))
-    ].copy()
-    log_count("Stage1 liquidity gate", liquidity_gate)
-
-    normal_gate = liquidity_gate.loc[
-        (liquidity_gate["volume_ratio"] >= max(min(MIN_VOLUME_RATIO, 1.0), 0.95))
-        & (
-            (liquidity_gate["close"] > liquidity_gate["ma20"])
-            | (liquidity_gate["close"] > liquidity_gate["ma60"])
-            | (liquidity_gate["macd"] > liquidity_gate["macd_signal"])
+    # 先保留最低流動性底線，不再要求成交值與均量都同時很高
+    liquidity_floor = (
+        (universe["turnover_100m"] >= MIN_TURNOVER_100M)
+        | (universe["volume_avg20"] >= MIN_AVG_VOLUME_LOT)
+        | (
+            (universe["turnover_100m"] >= max(MIN_TURNOVER_100M * 0.5, 0.5))
+            & (universe["volume_avg20"] >= max(MIN_AVG_VOLUME_LOT * 0.6, 80))
         )
-        & (liquidity_gate["pct_from_ma20"] <= max(MAX_DISTANCE_FROM_MA20, 12))
-    ].copy()
-    log_count("Stage1 normal gate", normal_gate)
+    )
+    base_trend_floor = (
+        (universe["close"] > universe["ma20"] * 0.99)
+        | (universe["close"] > universe["ma60"] * 0.99)
+        | (universe["macd_hist"] > -0.05)
+        | (universe["obv_trend"] > 0)
+        | (universe["near_high20_ratio"] >= 0.95)
+    )
 
-    if not normal_gate.empty:
-        return sort_stage1_candidates(normal_gate)
+    stage1_base = universe.loc[liquidity_floor & base_trend_floor].copy()
+    log_count("Stage1 base gate", stage1_base)
 
-    relaxed_gate_1 = liquidity_gate.loc[
-        (liquidity_gate["volume_ratio"] >= 0.9)
+    if stage1_base.empty:
+        return universe.head(0).copy()
+
+    # 三種模型都能進第一層的結構條件
+    stage1_focus = stage1_base.loc[
+        (stage1_base["pct_from_ma20"] <= max(STRONG_TREND_MAX_DISTANCE_FROM_MA20, 25))
         & (
-            (liquidity_gate["close"] > liquidity_gate["ma20"] * 0.985)
-            | (liquidity_gate["close"] > liquidity_gate["ma60"] * 0.985)
-            | (liquidity_gate["macd_hist"] > -0.03)
-            | (liquidity_gate["close"] > liquidity_gate["boll_mid"])
+            (stage1_base["volume_ratio"] >= STARTING_BREAKOUT_MIN_VOLUME_RATIO)
+            | (stage1_base["vol5_over_vol20"] >= STARTING_ACCUM_VOL5_OVER_VOL20_MIN)
+            | (stage1_base["near_high20_ratio"] >= STARTING_ACCUM_NEAR_HIGH20_RATIO)
+            | (stage1_base["is_above_ma20"])
+            | (stage1_base["is_above_ma60"])
         )
-        & (liquidity_gate["pct_from_ma20"] <= max(MAX_DISTANCE_FROM_MA20 + 8, 20))
+    ].copy()
+    log_count("Stage1 focus gate", stage1_focus)
+
+    if not stage1_focus.empty:
+        return sort_stage1_candidates(stage1_focus)
+
+    # fallback 1：只要沒破壞多頭結構且接近高點，也保留
+    relaxed_gate_1 = stage1_base.loc[
+        (
+            (stage1_base["near_high20_ratio"] >= 0.94)
+            | (stage1_base["close"] > stage1_base["boll_mid"])
+            | (stage1_base["macd_hist"] > -0.03)
+        )
+        & (stage1_base["pct_from_ma20"] <= max(STRONG_TREND_MAX_DISTANCE_FROM_MA20 + 5, 30))
     ].copy()
     log_count("Stage1 relaxed gate 1", relaxed_gate_1)
 
@@ -237,10 +341,17 @@ def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
         print("[SCAN] Fallback used: relaxed gate 1")
         return sort_stage1_candidates(relaxed_gate_1)
 
+    # fallback 2：保留高位附近與量能還在的股票
     relaxed_gate_2 = universe.loc[
-        (universe["turnover_100m"] >= max(MIN_TURNOVER_100M * 0.45, 1.0))
-        & (universe["volume_avg20"] >= max(MIN_AVG_VOLUME_LOT * 0.4, 50))
-        & (universe["volume_ratio"] >= 0.8)
+        (
+            (universe["turnover_100m"] >= max(MIN_TURNOVER_100M * 0.35, 0.3))
+            | (universe["volume_avg20"] >= max(MIN_AVG_VOLUME_LOT * 0.45, 60))
+        )
+        & (
+            (universe["volume_ratio"] >= 0.85)
+            | (universe["near_high20_ratio"] >= 0.95)
+            | (universe["obv_trend"] > 0)
+        )
     ].copy()
     log_count("Stage1 relaxed gate 2", relaxed_gate_2)
 
@@ -249,13 +360,13 @@ def first_stage_filter(df: pd.DataFrame) -> pd.DataFrame:
         return sort_stage1_candidates(relaxed_gate_2)
 
     emergency_pool = universe.sort_values(
-        ["turnover_100m", "volume_ratio", "volume_avg20"],
+        ["near_high20_ratio", "turnover_100m", "volume_ratio", "volume_avg20"],
         ascending=False,
-    ).head(min(SECOND_SCAN_LIMIT, 80)).copy()
+    ).head(min(SECOND_SCAN_LIMIT, 100)).copy()
     log_count("Stage1 emergency pool", emergency_pool)
 
     if not emergency_pool.empty:
-        print("[SCAN] Emergency pool used: please inspect first-stage thresholds or source fields")
+        print("[SCAN] Emergency pool used")
         return emergency_pool
 
     return universe.head(0).copy()
@@ -374,7 +485,6 @@ def merge_external_data(df: pd.DataFrame) -> pd.DataFrame:
 
     out["institution_force"] = (out["foreign_buy"] + out["trust_buy"]) / volume_base
     out["trust_force"] = out["trust_buy"] / volume_base
-
     out["institution_force"] = out["institution_force"].replace([np.inf, -np.inf], 0).fillna(0)
     out["trust_force"] = out["trust_force"].replace([np.inf, -np.inf], 0).fillna(0)
 
@@ -395,53 +505,53 @@ def calc_institution_score(row: pd.Series) -> float:
     close = float(row.get("close", 0) or 0)
 
     if investment_buy_days >= 5:
-        score += 14
+        score += 12
     elif investment_buy_days >= 3:
-        score += 10
+        score += 8
     elif investment_buy_days >= 2:
-        score += 6
+        score += 4
 
     if foreign_buy_days >= 5:
-        score += 10
+        score += 8
     elif foreign_buy_days >= 3:
-        score += 7
+        score += 5
     elif foreign_buy_days >= 2:
-        score += 4
+        score += 2
 
     if dealer_buy_days >= 5:
-        score += 4
+        score += 3
     elif dealer_buy_days >= 3:
         score += 2
     elif dealer_buy_days >= 2:
         score += 1
 
     if institution_force >= 0.12:
-        score += 12
+        score += 10
     elif institution_force >= 0.08:
-        score += 8
+        score += 7
     elif institution_force >= 0.05:
         score += 4
 
     if trust_force >= 0.08:
-        score += 10
+        score += 8
     elif trust_force >= 0.05:
-        score += 6
+        score += 5
     elif trust_force >= 0.03:
-        score += 3
+        score += 2
 
     if 1 <= trust_holding_pct <= 3:
-        score += 8
+        score += 6
     elif 3 < trust_holding_pct <= 8:
-        score += 5
+        score += 4
     elif trust_holding_pct > 15:
-        score -= 6
+        score -= 5
 
     if estimated_inst_cost > 0 and close > 0:
         diff_pct = abs(close - estimated_inst_cost) / estimated_inst_cost * 100
         if diff_pct <= 3:
-            score += 8
+            score += 6
         elif diff_pct <= 5:
-            score += 4
+            score += 3
 
     return score
 
@@ -476,11 +586,11 @@ def calc_breakout_score(row: pd.Series) -> float:
     volume_ratio = float(row.get("volume_ratio", 0) or 0)
 
     if close > p20 > 0:
-        score += 10
+        score += 8
     if close > p60 > 0:
-        score += 15
+        score += 12
     if volume_ratio >= 2:
-        score += 5
+        score += 4
     return score
 
 
@@ -520,7 +630,7 @@ def calculate_support_resistance(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
-    out = ensure_market_columns(df)
+    out = derive_pattern_features(df)
 
     for col in [
         "foreign_buy_days",
@@ -551,53 +661,24 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
     out["revenue_score"] = out.apply(calc_revenue_score, axis=1)
 
     out["tech_score"] = 0.0
-    out.loc[out["close"] > out["ma20"], "tech_score"] += 5
-    out.loc[out["close"] > out["ma60"], "tech_score"] += 8
-    out.loc[out["ma20"] > out["ma60"], "tech_score"] += 5
+    out.loc[out["is_above_ma20"], "tech_score"] += 4
+    out.loc[out["is_above_ma60"], "tech_score"] += 6
+    out.loc[out["ma20"] > out["ma60"], "tech_score"] += 4
 
-    out.loc[(out["volume_ratio"] >= 1.1) & (out["volume_ratio"] < 1.3), "tech_score"] += 4
-    out.loc[(out["volume_ratio"] >= 1.3) & (out["volume_ratio"] < 1.8), "tech_score"] += 7
-    out.loc[out["volume_ratio"] >= 1.8, "tech_score"] += 9
-
-    out.loc[(out["turnover_100m"] >= 5) & (out["turnover_100m"] < 10), "tech_score"] += 5
-    out.loc[out["turnover_100m"] >= 10, "tech_score"] += 8
+    out.loc[(out["volume_ratio"] >= 1.2) & (out["volume_ratio"] < 1.5), "tech_score"] += 4
+    out.loc[(out["volume_ratio"] >= 1.5) & (out["volume_ratio"] < 2.0), "tech_score"] += 6
+    out.loc[out["volume_ratio"] >= 2.0, "tech_score"] += 8
 
     out.loc[(out["rsi"] >= 50) & (out["rsi"] <= 72), "tech_score"] += 6
-    out.loc[(out["rsi"] > 72) & (out["rsi"] <= 78), "tech_score"] += 3
-    out.loc[out["rsi"] > 78, "tech_score"] -= 2
+    out.loc[(out["rsi"] > 72) & (out["rsi"] <= 80), "tech_score"] += 3
+    out.loc[out["rsi"] > 80, "tech_score"] -= 2
     out.loc[out["rsi"] < 35, "tech_score"] -= 2
 
-    out.loc[out["macd"] > out["macd_signal"], "tech_score"] += 6
-    out.loc[out["macd_hist"] > 0, "tech_score"] += 4
-    out.loc[out["close"] > out["boll_mid"], "tech_score"] += 4
-    out.loc[out["close"] > out["boll_upper"], "tech_score"] += 3
-    out.loc[out["obv_trend"] > 0, "tech_score"] += 6
-
-    out["score_starting"] = 0.0
-    out.loc[(out["close"] > out["ma20"]) & (out["close"] <= out["ma20"] * 1.08), "score_starting"] += 8
-    out.loc[(out["volume_ratio"] >= 1.1) & (out["volume_ratio"] < 1.3), "score_starting"] += 6
-    out.loc[(out["volume_ratio"] >= 1.3) & (out["volume_ratio"] < 1.8), "score_starting"] += 3
-    out.loc[out["macd"] > out["macd_signal"], "score_starting"] += 4
-    out.loc[(out["rsi"] >= 50) & (out["rsi"] <= 68), "score_starting"] += 5
-    out.loc[(out["rsi"] > 68) & (out["rsi"] <= 74), "score_starting"] += 2
-    out.loc[out["institution_force"] >= 0.05, "score_starting"] += 4
-    out.loc[out["turnover_100m"] >= 5, "score_starting"] += 3
-    out.loc[out["close"] > out["platform_high_20d"], "score_starting"] += 4
-    out.loc[out["pct_from_ma20"] > 8, "score_starting"] -= 6
-    out.loc[out["rsi"] > 78, "score_starting"] -= 6
-
-    out["score_second_wave"] = 0.0
-    out.loc[out["close"] > out["ma20"] * 1.03, "score_second_wave"] += 5
-    out.loc[out["close"] > out["ma60"], "score_second_wave"] += 4
-    out.loc[out["obv_trend"] > 0, "score_second_wave"] += 5
-    out.loc[out["macd_hist"] > 0, "score_second_wave"] += 5
-    out.loc[(out["rsi"] >= 60) & (out["rsi"] <= 78), "score_second_wave"] += 5
-    out.loc[(out["rsi"] > 78) & (out["rsi"] <= 84), "score_second_wave"] += 2
-    out.loc[out["investment_buy_days"] >= 3, "score_second_wave"] += 4
-    out.loc[out["foreign_buy_days"] >= 3, "score_second_wave"] += 3
-    out.loc[out["main_force_score"] >= 6, "score_second_wave"] += 4
-    out.loc[out["broker_score"] >= 5, "score_second_wave"] += 3
-    out.loc[out["pct_from_ma20"] > 15, "score_second_wave"] -= 5
+    out.loc[out["is_macd_positive"], "tech_score"] += 5
+    out.loc[out["is_macd_hist_positive"], "tech_score"] += 4
+    out.loc[out["close"] > out["boll_mid"], "tech_score"] += 3
+    out.loc[out["close"] > out["boll_upper"], "tech_score"] += 2
+    out.loc[out["obv_trend"] > 0, "tech_score"] += 5
 
     out["score_total"] = (
         out["tech_score"]
@@ -608,22 +689,114 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
         + out["revenue_score"]
     )
 
-    starting_bias = (
-        out["score_starting"]
-        + np.where(out["pct_from_ma20"] <= 8, 3, 0)
-        + np.where(out["volume_ratio"] <= 1.35, 2, 0)
-        - np.where(out["rsi"] >= 75, 4, 0)
+    # 剛啟動｜爆量突破
+    out["starting_breakout_score"] = 0.0
+    out.loc[out["volume_ratio"] >= STARTING_BREAKOUT_MIN_VOLUME_RATIO, "starting_breakout_score"] += 7
+    out.loc[out["close"] > out["platform_high_20d"], "starting_breakout_score"] += 8
+    out.loc[out["close"] > out["ma20"], "starting_breakout_score"] += 5
+    out.loc[
+        (out["rsi"] >= STARTING_BREAKOUT_RSI_MIN) & (out["rsi"] <= STARTING_BREAKOUT_RSI_MAX),
+        "starting_breakout_score",
+    ] += 6
+    out.loc[
+        out["pct_from_ma20"] <= STARTING_BREAKOUT_MAX_DISTANCE_FROM_MA20,
+        "starting_breakout_score",
+    ] += 5
+    out.loc[out["is_macd_positive"], "starting_breakout_score"] += 3
+    out.loc[out["obv_trend"] > 0, "starting_breakout_score"] += 2
+    out.loc[out["pct_from_ma20"] > STARTING_BREAKOUT_MAX_DISTANCE_FROM_MA20 + 3, "starting_breakout_score"] -= 6
+    out.loc[out["rsi"] > 80, "starting_breakout_score"] -= 4
+
+    # 剛啟動｜收籌墊高
+    out["starting_accum_score"] = 0.0
+    out.loc[
+        (out["pct_10d"] >= STARTING_ACCUM_10D_PCT_MIN) & (out["pct_10d"] <= STARTING_ACCUM_10D_PCT_MAX),
+        "starting_accum_score",
+    ] += 7
+    out.loc[out["drawdown_5d"] <= STARTING_ACCUM_5D_PULLBACK_MAX, "starting_accum_score"] += 6
+    out.loc[out["close"] >= out["ma20"] * STARTING_ACCUM_CLOSE_OVER_MA20, "starting_accum_score"] += 5
+    out.loc[out["ma20_slope"] > 0, "starting_accum_score"] += 5
+    out.loc[out["vol5_over_vol20"] >= STARTING_ACCUM_VOL5_OVER_VOL20_MIN, "starting_accum_score"] += 6
+    out.loc[out["obv_trend"] > 0, "starting_accum_score"] += 4
+    out.loc[out["near_high20_ratio"] >= STARTING_ACCUM_NEAR_HIGH20_RATIO, "starting_accum_score"] += 6
+    out.loc[out["is_macd_positive"], "starting_accum_score"] += 3
+    out.loc[out["pct_from_ma20"] > 15, "starting_accum_score"] -= 4
+
+    # 第二波
+    out["second_wave_score"] = 0.0
+    out.loc[out["close"] > out["ma60"], "second_wave_score"] += 6
+    out.loc[out["close"] > out["ma20"] * 1.02, "second_wave_score"] += 4
+    out.loc[out["obv_trend"] > 0, "second_wave_score"] += 5
+    out.loc[out["is_macd_hist_positive"], "second_wave_score"] += 5
+    out.loc[
+        (out["rsi"] >= SECOND_WAVE_MIN_RSI) & (out["rsi"] <= SECOND_WAVE_MAX_RSI),
+        "second_wave_score",
+    ] += 5
+    out.loc[out["volume_ratio"] >= SECOND_WAVE_MIN_VOLUME_RATIO, "second_wave_score"] += 3
+    out.loc[out["near_high20_ratio"] >= 0.96, "second_wave_score"] += 5
+    out.loc[out["drawdown_5d"] <= 6, "second_wave_score"] += 3
+    out.loc[out["broker_score"] >= 5, "second_wave_score"] += 3
+    out.loc[out["main_force_score"] >= 6, "second_wave_score"] += 4
+    out.loc[out["revenue_score"] >= 5, "second_wave_score"] += 3
+    out.loc[out["pct_from_ma20"] > SECOND_WAVE_MAX_DISTANCE_FROM_MA20, "second_wave_score"] -= 6
+
+    # 強者恆強
+    out["strong_trend_score"] = 0.0
+    out.loc[out["close"] > out["ma20"] * 1.08, "strong_trend_score"] += 7
+    out.loc[out["close"] > out["ma60"], "strong_trend_score"] += 5
+    out.loc[
+        (out["rsi"] >= STRONG_TREND_MIN_RSI) & (out["rsi"] <= STRONG_TREND_MAX_RSI),
+        "strong_trend_score",
+    ] += 6
+    out.loc[out["obv_trend"] > 0, "strong_trend_score"] += 5
+    out.loc[out["is_macd_hist_positive"], "strong_trend_score"] += 5
+    out.loc[out["near_high20_ratio"] >= STRONG_TREND_NEAR_HIGH20_RATIO, "strong_trend_score"] += 7
+    out.loc[out["volume_ratio"] >= STRONG_TREND_MIN_VOLUME_RATIO, "strong_trend_score"] += 3
+    out.loc[out["close"] > out["platform_high_60d"], "strong_trend_score"] += 5
+    out.loc[out["revenue_score"] >= 5, "strong_trend_score"] += 2
+    out.loc[out["pct_from_ma20"] > STRONG_TREND_MAX_DISTANCE_FROM_MA20, "strong_trend_score"] -= 5
+    out.loc[out["rsi"] > 90, "strong_trend_score"] -= 4
+
+    out["score_starting"] = np.maximum(out["starting_breakout_score"], out["starting_accum_score"])
+    out["score_second_wave"] = out["second_wave_score"]
+    out["score_strong_trend"] = out["strong_trend_score"]
+
+    out["radar_tag_main"] = "剛啟動"
+    out["radar_tag_sub"] = np.where(
+        out["starting_breakout_score"] >= out["starting_accum_score"],
+        "爆量突破",
+        "收籌墊高",
     )
 
-    second_wave_bias = (
-        out["score_second_wave"]
-        + np.where(out["close"] > out["ma60"], 2, 0)
-        + np.where(out["investment_buy_days"] >= 3, 2, 0)
-        + np.where(out["broker_score"] >= 5, 2, 0)
-        + np.where(out["rsi"] >= 70, 1, 0)
+    strong_mask = (
+        (out["strong_trend_score"] >= out["score_starting"])
+        & (out["strong_trend_score"] >= out["second_wave_score"])
+        & (out["strong_trend_score"] >= 17)
+    )
+    second_wave_mask = (
+        ~strong_mask
+        & (out["second_wave_score"] >= out["score_starting"])
+        & (out["second_wave_score"] >= 15)
     )
 
-    out["radar_tag"] = np.where(starting_bias >= second_wave_bias, "剛啟動", "可能第二波")
+    out.loc[strong_mask, "radar_tag_main"] = "強者恆強"
+    out.loc[strong_mask, "radar_tag_sub"] = ""
+    out.loc[second_wave_mask, "radar_tag_main"] = "可能第二波"
+    out.loc[second_wave_mask, "radar_tag_sub"] = ""
+
+    out["radar_tag"] = np.where(
+        out["radar_tag_main"] == "剛啟動",
+        out["radar_tag_main"] + "｜" + out["radar_tag_sub"],
+        out["radar_tag_main"],
+    )
+    out["tag"] = out["radar_tag"]
+
+    out["overall_priority_score"] = (
+        out["score_total"]
+        + np.where(out["radar_tag_main"] == "強者恆強", out["strong_trend_score"], 0)
+        + np.where(out["radar_tag_main"] == "可能第二波", out["second_wave_score"], 0)
+        + np.where(out["radar_tag_main"] == "剛啟動", out["score_starting"], 0)
+    )
 
     out = calculate_support_resistance(out)
 
@@ -638,10 +811,15 @@ def calculate_scores(df: pd.DataFrame) -> pd.DataFrame:
 def build_reason_and_targets(row: pd.Series) -> dict:
     reasons: list[str] = []
 
-    if row.get("radar_tag") == "剛啟動":
-        reasons.append("型態偏剛啟動，偏向較早期轉強")
-    else:
-        reasons.append("型態偏第二波，屬強勢整理後再攻候選")
+    main_tag = str(row.get("radar_tag_main") or "")
+    sub_tag = str(row.get("radar_tag_sub") or "")
+
+    if main_tag == "剛啟動":
+        reasons.append(f"型態偏剛啟動，子類型為{sub_tag or '待補'}")
+    elif main_tag == "可能第二波":
+        reasons.append("型態偏第二波，屬整理後再攻候選")
+    elif main_tag == "強者恆強":
+        reasons.append("型態偏強者恆強，屬主升段延續候選")
 
     if row.get("institution_score", 0) >= 12:
         reasons.append("法人籌碼加分明顯")
@@ -658,11 +836,6 @@ def build_reason_and_targets(row: pd.Series) -> dict:
     elif row.get("broker_score", 0) >= 5:
         reasons.append("分點有短線加分")
 
-    if row.get("breakout_score", 0) >= 15:
-        reasons.append("突破中期平台高點")
-    elif row.get("breakout_score", 0) >= 10:
-        reasons.append("突破短期平台高點")
-
     if row.get("revenue_score", 0) >= 10:
         reasons.append("營收成長動能強")
     elif row.get("revenue_score", 0) >= 5:
@@ -672,9 +845,13 @@ def build_reason_and_targets(row: pd.Series) -> dict:
         reasons.append("量比放大，資金關注提高")
     elif row.get("volume_ratio", 0) >= 1.3:
         reasons.append("量能優於均值")
-    elif row.get("volume_ratio", 0) >= 1.1:
-        reasons.append("量能剛開始轉強")
+    elif row.get("vol5_over_vol20", 0) >= STARTING_ACCUM_VOL5_OVER_VOL20_MIN:
+        reasons.append("5日均量高於20日均量，偏收籌墊高")
 
+    if row.get("close", 0) > row.get("platform_high_20d", 0) > 0:
+        reasons.append("突破短期平台高點")
+    if row.get("close", 0) > row.get("platform_high_60d", 0) > 0:
+        reasons.append("突破中期平台高點")
     if row.get("close", 0) > row.get("ma20", 0) > 0:
         reasons.append("站上 MA20")
     if row.get("close", 0) > row.get("ma60", 0) > 0:
@@ -683,6 +860,8 @@ def build_reason_and_targets(row: pd.Series) -> dict:
         reasons.append("MACD 偏多")
     if row.get("obv_trend", 0) > 0:
         reasons.append("OBV 走升")
+    if row.get("near_high20_ratio", 0) >= STRONG_TREND_NEAR_HIGH20_RATIO:
+        reasons.append("股價貼近20日高點")
 
     short_reasons = reasons[:4]
     reason_text = "；".join(short_reasons) if short_reasons else "符合模型條件"
@@ -718,23 +897,44 @@ def build_payload(raw_df: pd.DataFrame, analyzed_df: pd.DataFrame) -> dict:
     top30_df = analyzed_df.head(TOP30_COUNT).copy()
     watchlist_df = analyzed_df.iloc[TOP30_COUNT:TOP30_COUNT + WATCHLIST_COUNT].copy()
 
-    starting_df = analyzed_df[analyzed_df["radar_tag"] == "剛啟動"].sort_values(
-        ["score_starting", "score_total", "turnover_100m"],
+    starting_df = analyzed_df[analyzed_df["radar_tag_main"] == "剛啟動"].sort_values(
+        ["score_starting", "overall_priority_score", "turnover_100m"],
         ascending=False,
     ).head(TOP30_COUNT).copy()
 
-    second_wave_df = analyzed_df[analyzed_df["radar_tag"] == "可能第二波"].sort_values(
-        ["score_second_wave", "score_total", "turnover_100m"],
+    starting_breakout_df = analyzed_df[
+        (analyzed_df["radar_tag_main"] == "剛啟動")
+        & (analyzed_df["radar_tag_sub"] == "爆量突破")
+    ].sort_values(
+        ["starting_breakout_score", "overall_priority_score", "turnover_100m"],
+        ascending=False,
+    ).head(TOP30_COUNT).copy()
+
+    starting_accum_df = analyzed_df[
+        (analyzed_df["radar_tag_main"] == "剛啟動")
+        & (analyzed_df["radar_tag_sub"] == "收籌墊高")
+    ].sort_values(
+        ["starting_accum_score", "overall_priority_score", "turnover_100m"],
+        ascending=False,
+    ).head(TOP30_COUNT).copy()
+
+    second_wave_df = analyzed_df[analyzed_df["radar_tag_main"] == "可能第二波"].sort_values(
+        ["second_wave_score", "overall_priority_score", "turnover_100m"],
+        ascending=False,
+    ).head(TOP30_COUNT).copy()
+
+    strong_trend_df = analyzed_df[analyzed_df["radar_tag_main"] == "強者恆強"].sort_values(
+        ["strong_trend_score", "overall_priority_score", "turnover_100m"],
         ascending=False,
     ).head(TOP30_COUNT).copy()
 
     broker_track_df = analyzed_df.sort_values(
-        ["broker_score", "main_force_score", "score_total"],
+        ["broker_score", "main_force_score", "overall_priority_score"],
         ascending=False,
     ).head(BROKER_TRACK_COUNT).copy()
 
     risk_overheated_df = analyzed_df[
-        (analyzed_df["volume_ratio"] >= 2.5) & (analyzed_df["rsi"] >= 80)
+        (analyzed_df["volume_ratio"] >= 2.5) & (analyzed_df["rsi"] >= 82)
     ].head(20).copy()
 
     high_turnover_df = analyzed_df.sort_values(
@@ -746,14 +946,26 @@ def build_payload(raw_df: pd.DataFrame, analyzed_df: pd.DataFrame) -> dict:
         "summary": {
             "market_scanned": int(len(raw_df)),
             "selected": int(len(analyzed_df)),
-            "starting_count": int(len(starting_df)),
-            "second_wave_count": int(len(second_wave_df)),
+            "starting_count": int(len(analyzed_df[analyzed_df["radar_tag_main"] == "剛啟動"])),
+            "starting_breakout_count": int(len(analyzed_df[
+                (analyzed_df["radar_tag_main"] == "剛啟動")
+                & (analyzed_df["radar_tag_sub"] == "爆量突破")
+            ])),
+            "starting_accum_count": int(len(analyzed_df[
+                (analyzed_df["radar_tag_main"] == "剛啟動")
+                & (analyzed_df["radar_tag_sub"] == "收籌墊高")
+            ])),
+            "second_wave_count": int(len(analyzed_df[analyzed_df["radar_tag_main"] == "可能第二波"])),
+            "strong_trend_count": int(len(analyzed_df[analyzed_df["radar_tag_main"] == "強者恆強"])),
             "overheated_count": int(len(risk_overheated_df)),
         },
         "top30": build_table_rows(top30_df),
         "watchlist": build_table_rows(watchlist_df),
         "starting": build_table_rows(starting_df),
+        "starting_breakout": build_table_rows(starting_breakout_df),
+        "starting_accum": build_table_rows(starting_accum_df),
         "second_wave": build_table_rows(second_wave_df),
+        "strong_trend": build_table_rows(strong_trend_df),
         "broker_track": build_table_rows(broker_track_df),
         "overheated": build_table_rows(risk_overheated_df),
         "high_turnover": build_table_rows(high_turnover_df),
@@ -825,7 +1037,7 @@ def run_scan(save: bool = True, progress_callback=None) -> dict:
     print("[SCAN] Step 4: calculate scores")
     analyzed_df = calculate_scores(stage2_input)
     analyzed_df = analyzed_df.sort_values(
-        ["score_total", "turnover_100m", "volume_ratio"],
+        ["overall_priority_score", "score_total", "turnover_100m", "volume_ratio"],
         ascending=False,
     ).reset_index(drop=True)
     print(f"[SCAN] Final analyzed rows: {len(analyzed_df)}")
