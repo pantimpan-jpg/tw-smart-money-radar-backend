@@ -7,11 +7,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from config import MAX_WORKERS
 from finmind_client import finmind_get
 
 
 PRICE_LOOKBACK_DAYS = 180
-MAX_WORKERS = 12
 MIN_UNIVERSE_SIZE = 300
 
 EXCLUDED_NAME_KEYWORDS = [
@@ -109,6 +109,16 @@ def _obv(close: pd.Series, volume: pd.Series) -> pd.Series:
     return (direction * volume.fillna(0)).cumsum()
 
 
+def _pct_change_from_n_days(close: pd.Series, n: int) -> float:
+    if len(close) <= n:
+      return 0.0
+    base = _to_float(close.iloc[-(n + 1)])
+    latest = _to_float(close.iloc[-1])
+    if base == 0:
+        return 0.0
+    return (latest - base) / base * 100.0
+
+
 def _build_empty_row(stock_id: str, name: str, group: str, skipped_reason: str | None = None) -> dict[str, Any]:
     return {
         "stock_id": stock_id,
@@ -137,6 +147,12 @@ def _build_empty_row(stock_id: str, name: str, group: str, skipped_reason: str |
         "low_20d": 0.0,
         "high_5d": 0.0,
         "high_20d": 0.0,
+        "pct_5d": 0.0,
+        "pct_10d": 0.0,
+        "drawdown_5d": 0.0,
+        "vol5_over_vol20": 0.0,
+        "ma20_slope": 0.0,
+        "near_high20_ratio": 0.0,
         "trade_warning": "",
         "is_restricted": False,
         "fetch_skipped_reason": skipped_reason,
@@ -186,6 +202,7 @@ def _build_stock_snapshot(stock_id: str, name: str, group: str, price_df: pd.Dat
     ma20 = close.rolling(20).mean()
     ma60 = close.rolling(60).mean()
     vol_avg20 = volume.rolling(20).mean()
+    vol_avg5 = volume.rolling(5).mean()
 
     rsi14 = _rsi(close, 14)
     macd_line, macd_signal, macd_hist = _macd(close)
@@ -200,6 +217,7 @@ def _build_stock_snapshot(stock_id: str, name: str, group: str, price_df: pd.Dat
     latest_ma20 = _to_float(ma20.iloc[-1])
     latest_ma60 = _to_float(ma60.iloc[-1])
     latest_vol_avg20 = _to_float(vol_avg20.iloc[-1])
+    latest_vol_avg5 = _to_float(vol_avg5.iloc[-1])
 
     latest_rsi = _to_float(rsi14.iloc[-1])
     latest_macd = _to_float(macd_line.iloc[-1])
@@ -223,6 +241,19 @@ def _build_stock_snapshot(stock_id: str, name: str, group: str, price_df: pd.Dat
     low_20d = _to_float(low.tail(20).min())
     high_5d = _to_float(high.tail(5).max())
     high_20d = _to_float(high.tail(20).max())
+
+    pct_5d = _pct_change_from_n_days(close, 5)
+    pct_10d = _pct_change_from_n_days(close, 10)
+    drawdown_5d = ((high_5d - latest_close) / high_5d * 100) if high_5d else 0.0
+    vol5_over_vol20 = (latest_vol_avg5 / latest_vol_avg20) if latest_vol_avg20 else 0.0
+    ma20_slope = 0.0
+    if len(ma20.dropna()) >= 6:
+        ma20_now = _to_float(ma20.iloc[-1])
+        ma20_prev5 = _to_float(ma20.iloc[-6])
+        if ma20_prev5:
+            ma20_slope = (ma20_now - ma20_prev5) / ma20_prev5 * 100.0
+
+    near_high20_ratio = (latest_close / high_20d) if high_20d else 0.0
 
     return {
         "stock_id": stock_id,
@@ -251,6 +282,12 @@ def _build_stock_snapshot(stock_id: str, name: str, group: str, price_df: pd.Dat
         "low_20d": round(low_20d, 2),
         "high_5d": round(high_5d, 2),
         "high_20d": round(high_20d, 2),
+        "pct_5d": round(pct_5d, 2),
+        "pct_10d": round(pct_10d, 2),
+        "drawdown_5d": round(drawdown_5d, 2),
+        "vol5_over_vol20": round(vol5_over_vol20, 3),
+        "ma20_slope": round(ma20_slope, 2),
+        "near_high20_ratio": round(near_high20_ratio, 4),
         "trade_warning": "",
         "is_restricted": False,
         "fetch_skipped_reason": None,
@@ -327,7 +364,6 @@ def _fetch_stock_info_full() -> pd.DataFrame:
         print(f"[FETCH] TaiwanStockInfo candidate {label}: {len(df)} rows")
 
     best_label, best_df = max(candidates, key=lambda item: len(item[1]))
-
     print(f"[FETCH] TaiwanStockInfo selected candidate {best_label}: {len(best_df)} rows")
 
     if best_df.empty:
@@ -351,8 +387,7 @@ def fetch_stock_universe() -> pd.DataFrame:
     if len(info_df) < MIN_UNIVERSE_SIZE:
         sample_ids = info_df["stock_id"].head(20).tolist()
         raise RuntimeError(
-            f"TaiwanStockInfo 股票母體異常，只有 {len(info_df)} 檔。"
-            f"sample={sample_ids}"
+            f"TaiwanStockInfo 股票母體異常，只有 {len(info_df)} 檔。sample={sample_ids}"
         )
 
     info_df["is_excluded"] = info_df.apply(
@@ -375,8 +410,7 @@ def fetch_stock_universe() -> pd.DataFrame:
     if len(info_df) < MIN_UNIVERSE_SIZE:
         sample_ids = info_df["stock_id"].head(20).tolist()
         raise RuntimeError(
-            f"排除 ETF/金融後股票母體異常，只有 {len(info_df)} 檔。"
-            f"sample={sample_ids}"
+            f"排除 ETF/金融後股票母體異常，只有 {len(info_df)} 檔。sample={sample_ids}"
         )
 
     return info_df[["stock_id", "name", "group"]]
@@ -397,7 +431,11 @@ def fetch_market_snapshot_parallel(progress_callback=None) -> pd.DataFrame:
     failed = 0
     skipped = 0
 
-    print(f"[FETCH] start market snapshot | universe={total} | lookback_days={PRICE_LOOKBACK_DAYS}")
+    worker_count = max(1, int(MAX_WORKERS))
+    print(
+        f"[FETCH] start market snapshot | universe={total} "
+        f"| lookback_days={PRICE_LOOKBACK_DAYS} | workers={worker_count}"
+    )
 
     if progress_callback:
         progress_callback(
@@ -414,7 +452,7 @@ def fetch_market_snapshot_parallel(progress_callback=None) -> pd.DataFrame:
             }
         )
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
         future_map = {
             executor.submit(
                 _fetch_one_stock,
@@ -501,10 +539,19 @@ def fetch_market_snapshot_parallel(progress_callback=None) -> pd.DataFrame:
         "low_20d",
         "high_5d",
         "high_20d",
+        "pct_5d",
+        "pct_10d",
+        "drawdown_5d",
+        "vol5_over_vol20",
+        "ma20_slope",
+        "near_high20_ratio",
     ]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    df = df.sort_values(["turnover_100m", "volume_ratio"], ascending=False).reset_index(drop=True)
+    df = df.sort_values(
+        ["near_high20_ratio", "turnover_100m", "volume_ratio"],
+        ascending=False,
+    ).reset_index(drop=True)
     return df
