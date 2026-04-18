@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from typing import Any
@@ -11,8 +13,10 @@ from config import MAX_WORKERS
 from finmind_client import finmind_get
 
 
-PRICE_LOOKBACK_DAYS = 180
+PRICE_LOOKBACK_DAYS = 150
 MIN_UNIVERSE_SIZE = 300
+SAFE_MAX_WORKERS = 4
+FETCH_BATCH_SIZE_MULTIPLIER = 25
 
 EXCLUDED_NAME_KEYWORDS = [
     "ETF",
@@ -37,6 +41,50 @@ EXCLUDED_GROUP_KEYWORDS = [
 
 EXCLUDED_STOCK_ID_PREFIXES: list[str] = []
 
+EXCLUDED_NAME_PATTERN = "|".join(re.escape(keyword.upper()) for keyword in EXCLUDED_NAME_KEYWORDS)
+EXCLUDED_GROUP_PATTERN = "|".join(re.escape(keyword) for keyword in EXCLUDED_GROUP_KEYWORDS)
+
+SNAPSHOT_NUMERIC_COLUMNS = [
+    "close",
+    "change_pct",
+    "volume",
+    "turnover_100m",
+    "volume_ratio",
+    "volume_avg20",
+    "ma20",
+    "ma60",
+    "pct_from_ma20",
+    "rsi",
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    "boll_mid",
+    "boll_upper",
+    "obv_trend",
+    "platform_high_20d",
+    "platform_high_60d",
+    "low_5d",
+    "low_20d",
+    "high_5d",
+    "high_20d",
+    "pct_5d",
+    "pct_10d",
+    "drawdown_5d",
+    "vol5_over_vol20",
+    "ma20_slope",
+    "near_high20_ratio",
+]
+
+SNAPSHOT_COLUMNS = [
+    "stock_id",
+    "name",
+    "group",
+    *SNAPSHOT_NUMERIC_COLUMNS,
+    "trade_warning",
+    "is_restricted",
+    "fetch_skipped_reason",
+]
+
 
 def _to_float(value: Any) -> float:
     try:
@@ -50,28 +98,35 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
+def _to_float_series(series: pd.Series | None, fill_value: float = 0.0) -> pd.Series:
+    if series is None:
+        return pd.Series(dtype="float32")
+    out = pd.to_numeric(series, errors="coerce").fillna(fill_value)
+    return pd.to_numeric(out, downcast="float")
+
+
 def _safe_series(df: pd.DataFrame, *candidates: str) -> pd.Series:
     for col in candidates:
         if col in df.columns:
             return pd.to_numeric(df[col], errors="coerce")
-    return pd.Series(dtype=float)
+    return pd.Series(index=df.index, dtype="float32")
 
 
-def _is_excluded_stock(stock_id: str, name: str, group: str) -> bool:
-    stock_id_text = str(stock_id or "").strip()
-    name_text = str(name or "").upper()
-    group_text = str(group or "").strip()
+def _downcast_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        df[col] = pd.to_numeric(df[col], downcast="float")
 
-    if any(stock_id_text.startswith(prefix) for prefix in EXCLUDED_STOCK_ID_PREFIXES):
-        return True
+    bool_cols = df.select_dtypes(include=["bool"]).columns.tolist()
+    for col in bool_cols:
+        df[col] = df[col].astype(bool)
 
-    if any(keyword.upper() in name_text for keyword in EXCLUDED_NAME_KEYWORDS):
-        return True
+    for col in ("stock_id", "name", "group", "trade_warning", "fetch_skipped_reason"):
+        if col in df.columns:
+            df[col] = df[col].astype("string")
 
-    if any(keyword in group_text for keyword in EXCLUDED_GROUP_KEYWORDS):
-        return True
-
-    return False
+    return df
 
 
 def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -111,7 +166,7 @@ def _obv(close: pd.Series, volume: pd.Series) -> pd.Series:
 
 def _pct_change_from_n_days(close: pd.Series, n: int) -> float:
     if len(close) <= n:
-      return 0.0
+        return 0.0
     base = _to_float(close.iloc[-(n + 1)])
     latest = _to_float(close.iloc[-1])
     if base == 0:
@@ -124,7 +179,6 @@ def _build_empty_row(stock_id: str, name: str, group: str, skipped_reason: str |
         "stock_id": stock_id,
         "name": name,
         "group": group,
-        "theme": "其他",
         "close": 0.0,
         "change_pct": 0.0,
         "volume": 0.0,
@@ -163,10 +217,28 @@ def _build_stock_snapshot(stock_id: str, name: str, group: str, price_df: pd.Dat
     if price_df.empty:
         return _build_empty_row(stock_id, name, group, skipped_reason="empty_price")
 
-    df = price_df.copy()
-
-    if "date" not in df.columns:
+    if "date" not in price_df.columns:
         return _build_empty_row(stock_id, name, group, skipped_reason="missing_date")
+
+    keep_cols = [
+        col
+        for col in [
+            "date",
+            "open",
+            "close",
+            "max",
+            "high",
+            "min",
+            "low",
+            "Trading_Volume",
+            "trading_volume",
+            "volume",
+            "Trading_money",
+            "trading_money",
+        ]
+        if col in price_df.columns
+    ]
+    df = price_df.loc[:, keep_cols].copy()
 
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date"]).sort_values("date")
@@ -174,30 +246,24 @@ def _build_stock_snapshot(stock_id: str, name: str, group: str, price_df: pd.Dat
         return _build_empty_row(stock_id, name, group, skipped_reason="invalid_date")
 
     close = _safe_series(df, "close")
-    open_ = _safe_series(df, "open")
-    high = _safe_series(df, "max", "high")
-    low = _safe_series(df, "min", "low")
-    volume = _safe_series(df, "Trading_Volume", "trading_volume", "volume")
-    trading_money = _safe_series(df, "Trading_money", "trading_money")
+    close = _to_float_series(close)
+    valid_close_mask = close.notna()
 
-    df = df.assign(
-        close_num=close,
-        open_num=open_,
-        high_num=high,
-        low_num=low,
-        volume_num=volume,
-        money_num=trading_money,
-    ).dropna(subset=["close_num"])
+    if not valid_close_mask.any():
+        return _build_empty_row(stock_id, name, group, skipped_reason="invalid_close")
 
-    if len(df) < 70:
+    df = df.loc[valid_close_mask].reset_index(drop=True)
+    close = close.loc[valid_close_mask].reset_index(drop=True)
+
+    if len(close) < 70:
         return _build_empty_row(stock_id, name, group, skipped_reason="not_enough_bars")
 
-    close = df["close_num"]
-    open_ = df["open_num"].fillna(close)
-    high = df["high_num"].fillna(close)
-    low = df["low_num"].fillna(close)
-    volume = df["volume_num"].fillna(0)
-    trading_money = df["money_num"].fillna(close * volume)
+    open_ = _to_float_series(_safe_series(df, "open"), fill_value=np.nan).fillna(close)
+    high = _to_float_series(_safe_series(df, "max", "high"), fill_value=np.nan).fillna(close)
+    low = _to_float_series(_safe_series(df, "min", "low"), fill_value=np.nan).fillna(close)
+    volume = _to_float_series(_safe_series(df, "Trading_Volume", "trading_volume", "volume"))
+    trading_money = _to_float_series(_safe_series(df, "Trading_money", "trading_money"), fill_value=np.nan)
+    trading_money = trading_money.fillna(close * volume)
 
     ma20 = close.rolling(20).mean()
     ma60 = close.rolling(60).mean()
@@ -246,8 +312,10 @@ def _build_stock_snapshot(stock_id: str, name: str, group: str, price_df: pd.Dat
     pct_10d = _pct_change_from_n_days(close, 10)
     drawdown_5d = ((high_5d - latest_close) / high_5d * 100) if high_5d else 0.0
     vol5_over_vol20 = (latest_vol_avg5 / latest_vol_avg20) if latest_vol_avg20 else 0.0
+
     ma20_slope = 0.0
-    if len(ma20.dropna()) >= 6:
+    ma20_valid = ma20.dropna()
+    if len(ma20_valid) >= 6:
         ma20_now = _to_float(ma20.iloc[-1])
         ma20_prev5 = _to_float(ma20.iloc[-6])
         if ma20_prev5:
@@ -259,7 +327,6 @@ def _build_stock_snapshot(stock_id: str, name: str, group: str, price_df: pd.Dat
         "stock_id": stock_id,
         "name": name,
         "group": group,
-        "theme": "其他",
         "close": round(latest_close, 2),
         "change_pct": round(latest_change_pct, 2),
         "volume": latest_volume,
@@ -297,7 +364,9 @@ def _build_stock_snapshot(stock_id: str, name: str, group: str, price_df: pd.Dat
 def _fetch_one_stock(stock_id: str, name: str, group: str, start_date: str) -> dict[str, Any]:
     try:
         price_df = finmind_get("TaiwanStockPrice", stock_id, start_date)
-        return _build_stock_snapshot(stock_id, name, group, price_df)
+        result = _build_stock_snapshot(stock_id, name, group, price_df)
+        del price_df
+        return result
     except Exception:
         return _build_empty_row(stock_id, name, group, skipped_reason="fetch_error")
 
@@ -332,6 +401,7 @@ def _normalize_stock_info_df(df: pd.DataFrame) -> pd.DataFrame:
     if "stock_id" not in out.columns:
         raise ValueError("TaiwanStockInfo 缺少 stock_id 欄位")
 
+    out = out[["stock_id", "name", "group"]].copy()
     out["stock_id"] = out["stock_id"].astype(str)
     out["name"] = out["name"].astype(str)
     out["group"] = out["group"].fillna("").astype(str)
@@ -390,14 +460,15 @@ def fetch_stock_universe() -> pd.DataFrame:
             f"TaiwanStockInfo 股票母體異常，只有 {len(info_df)} 檔。sample={sample_ids}"
         )
 
-    info_df["is_excluded"] = info_df.apply(
-        lambda x: _is_excluded_stock(
-            stock_id=str(x["stock_id"]),
-            name=str(x["name"]),
-            group=str(x["group"]),
-        ),
-        axis=1,
-    )
+    if EXCLUDED_STOCK_ID_PREFIXES:
+        prefix_mask = info_df["stock_id"].astype(str).str.startswith(tuple(EXCLUDED_STOCK_ID_PREFIXES), na=False)
+    else:
+        prefix_mask = pd.Series(False, index=info_df.index)
+
+    name_mask = info_df["name"].fillna("").astype(str).str.upper().str.contains(EXCLUDED_NAME_PATTERN, regex=True, na=False)
+    group_mask = info_df["group"].fillna("").astype(str).str.contains(EXCLUDED_GROUP_PATTERN, regex=True, na=False)
+
+    info_df["is_excluded"] = prefix_mask | name_mask | group_mask
 
     excluded_count = int(info_df["is_excluded"].sum())
     print(f"[FETCH] excluded ETF/financial count: {excluded_count}")
@@ -416,12 +487,18 @@ def fetch_stock_universe() -> pd.DataFrame:
     return info_df[["stock_id", "name", "group"]]
 
 
+def _iter_universe_batches(universe_df: pd.DataFrame, batch_size: int):
+    total = len(universe_df)
+    for start in range(0, total, batch_size):
+        yield start, min(start + batch_size, total), universe_df.iloc[start:start + batch_size]
+
+
 def fetch_market_snapshot_parallel(progress_callback=None) -> pd.DataFrame:
     universe_df = fetch_stock_universe()
     total = len(universe_df)
 
     if total == 0:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=SNAPSHOT_COLUMNS)
 
     start_date = (date.today() - timedelta(days=PRICE_LOOKBACK_DAYS)).isoformat()
 
@@ -431,10 +508,12 @@ def fetch_market_snapshot_parallel(progress_callback=None) -> pd.DataFrame:
     failed = 0
     skipped = 0
 
-    worker_count = max(1, int(MAX_WORKERS))
+    worker_count = min(max(1, int(MAX_WORKERS)), SAFE_MAX_WORKERS)
+    batch_size = max(worker_count * FETCH_BATCH_SIZE_MULTIPLIER, worker_count)
+
     print(
         f"[FETCH] start market snapshot | universe={total} "
-        f"| lookback_days={PRICE_LOOKBACK_DAYS} | workers={worker_count}"
+        f"| lookback_days={PRICE_LOOKBACK_DAYS} | workers={worker_count} | batch_size={batch_size}"
     )
 
     if progress_callback:
@@ -452,58 +531,63 @@ def fetch_market_snapshot_parallel(progress_callback=None) -> pd.DataFrame:
             }
         )
 
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_map = {
-            executor.submit(
-                _fetch_one_stock,
-                str(row.stock_id),
-                str(row.name),
-                str(row.group),
-                start_date,
-            ): str(row.stock_id)
-            for row in universe_df.itertuples(index=False)
-        }
+    for batch_start, batch_end, batch_df in _iter_universe_batches(universe_df, batch_size):
+        print(f"[FETCH] batch {batch_start + 1}-{batch_end}/{total}")
 
-        for future in as_completed(future_map):
-            result = future.result()
-            results.append(result)
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_map = {
+                executor.submit(
+                    _fetch_one_stock,
+                    str(row.stock_id),
+                    str(row.name),
+                    str(row.group),
+                    start_date,
+                ): str(row.stock_id)
+                for row in batch_df.itertuples(index=False)
+            }
 
-            processed += 1
+            for future in as_completed(future_map):
+                result = future.result()
+                results.append(result)
 
-            reason = result.get("fetch_skipped_reason")
-            if reason is None:
-                success += 1
-            elif reason == "fetch_error":
-                failed += 1
-            else:
-                skipped += 1
+                processed += 1
 
-            if processed % 200 == 0 or processed == total:
-                print(
-                    f"[FETCH] progress processed={processed}/{total} "
-                    f"success={success} failed={failed} skipped={skipped}"
-                )
+                reason = result.get("fetch_skipped_reason")
+                if reason is None:
+                    success += 1
+                elif reason == "fetch_error":
+                    failed += 1
+                else:
+                    skipped += 1
 
-            if progress_callback:
-                percent = min(87, int(processed / total * 87))
-                progress_callback(
-                    {
-                        "scan_running": True,
-                        "stage": "fetch",
-                        "percent": percent,
-                        "message": "抓取全市場資料中",
-                        "processed": processed,
-                        "total": total,
-                        "success": success,
-                        "failed": failed,
-                        "skipped": skipped,
-                    }
-                )
+                if processed % 100 == 0 or processed == total:
+                    print(
+                        f"[FETCH] progress processed={processed}/{total} "
+                        f"success={success} failed={failed} skipped={skipped}"
+                    )
+
+                if progress_callback:
+                    percent = min(87, int(processed / total * 87))
+                    progress_callback(
+                        {
+                            "scan_running": True,
+                            "stage": "fetch",
+                            "percent": percent,
+                            "message": "抓取全市場資料中",
+                            "processed": processed,
+                            "total": total,
+                            "success": success,
+                            "failed": failed,
+                            "skipped": skipped,
+                        }
+                    )
+
+        gc.collect()
 
     if not results:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=SNAPSHOT_COLUMNS)
 
-    df = pd.DataFrame(results)
+    df = pd.DataFrame.from_records(results, columns=SNAPSHOT_COLUMNS)
     print(f"[FETCH] raw snapshot results rows: {len(df)}")
 
     if "fetch_skipped_reason" in df.columns:
@@ -514,44 +598,19 @@ def fetch_market_snapshot_parallel(progress_callback=None) -> pd.DataFrame:
     print(f"[FETCH] usable snapshot rows: {len(df)}")
 
     if df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=SNAPSHOT_COLUMNS)
 
-    numeric_cols = [
-        "close",
-        "change_pct",
-        "volume",
-        "turnover_100m",
-        "volume_ratio",
-        "volume_avg20",
-        "ma20",
-        "ma60",
-        "pct_from_ma20",
-        "rsi",
-        "macd",
-        "macd_signal",
-        "macd_hist",
-        "boll_mid",
-        "boll_upper",
-        "obv_trend",
-        "platform_high_20d",
-        "platform_high_60d",
-        "low_5d",
-        "low_20d",
-        "high_5d",
-        "high_20d",
-        "pct_5d",
-        "pct_10d",
-        "drawdown_5d",
-        "vol5_over_vol20",
-        "ma20_slope",
-        "near_high20_ratio",
-    ]
-    for col in numeric_cols:
+    for col in SNAPSHOT_NUMERIC_COLUMNS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+            df[col] = pd.to_numeric(df[col], downcast="float")
+
+    if "is_restricted" in df.columns:
+        df["is_restricted"] = df["is_restricted"].astype(bool)
 
     df = df.sort_values(
         ["near_high20_ratio", "turnover_100m", "volume_ratio"],
         ascending=False,
     ).reset_index(drop=True)
-    return df
+
+    return _downcast_dataframe(df)
